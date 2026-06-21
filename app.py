@@ -21,6 +21,7 @@ from xrd_crystal.indexing import find_peaks_derivative, index_pattern, Peak, d_f
 from xrd_crystal.le_bail import le_bail_fit
 from xrd_crystal.visualization import plot_crystal_3d, get_atom_color
 from xrd_crystal.quantitative_analysis import quantitative_analysis, QuantitativeResult, PhaseQuantResult
+from xrd_crystal.fit_diagnosis import diagnose_fit_quality, DiagnosisStatus, FitDiagnosisResult, DiagnosisItem
 
 
 st.set_page_config(
@@ -1718,6 +1719,60 @@ def quantitative_analysis_section():
                 
                 if has_bg_std_warning or any(_is_std_invalid(pr.weight_std) for pr in result.phase_results):
                     st.caption("💡 提示：标准误差无法计算或极小时，通常表示：(1) 该参数对拟合质量影响较小；(2) 多个参数存在强共线性（冗余）；(3) 算法未收敛至参数空间的稳定区域。建议检查实验数据质量或调整晶相选择。")
+            
+            st.markdown("---")
+            
+            st.subheader("🔍 拟合质量诊断")
+            
+            diagnosis = diagnose_fit_quality(result)
+            
+            status_colors = {
+                DiagnosisStatus.PASS: {"bg": "#d4edda", "text": "#155724", "border": "#c3e6cb", "icon": "✓"},
+                DiagnosisStatus.WARNING: {"bg": "#fff3cd", "text": "#856404", "border": "#ffeeba", "icon": "⚠"},
+                DiagnosisStatus.ERROR: {"bg": "#f8d7da", "text": "#721c24", "border": "#f5c6cb", "icon": "✗"}
+            }
+            
+            for item in diagnosis.items:
+                colors = status_colors[item.status]
+                
+                card_html = f"""
+                <div style="
+                    background-color: {colors['bg']};
+                    border: 1px solid {colors['border']};
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    margin-bottom: 8px;
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                ">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="font-size: 18px;">{colors['icon']}</span>
+                        <span style="font-weight: 600; color: {colors['text']};">{item.name}</span>
+                    </div>
+                    <div style="text-align: right;">
+                        <div style="color: {colors['text']}; font-weight: 500;">{item.message}</div>
+                        {f'<div style="color: {colors["text"]}; opacity: 0.7; font-size: 12px; margin-top: 2px;">{item.detail}</div>' if item.detail else ''}
+                    </div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
+            
+            summary_icon = "✅" if diagnosis.error_count == 0 and diagnosis.warning_count == 0 else ("⚠️" if diagnosis.error_count == 0 else "❌")
+            st.markdown(f"""
+            <div style="
+                background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 8px;
+                padding: 14px 18px;
+                margin-top: 12px;
+                text-align: center;
+                font-weight: 600;
+                font-size: 15px;
+            ">
+                {summary_icon} {diagnosis.summary}
+            </div>
+            """, unsafe_allow_html=True)
 
 
 def remove_linear_baseline(two_theta: np.ndarray, intensity: np.ndarray) -> np.ndarray:
