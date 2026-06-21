@@ -8,7 +8,7 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 
 from .crystal import Crystal, Atom
-from .space_group import SpaceGroup, generate_equivalent_positions, multiplicity, get_space_group_by_number
+from .space_group import SpaceGroup, generate_equivalent_positions, multiplicity, get_space_group_by_number, _get_lattice_type, parse_symop_xyz, SymmetryOperation
 from .scattering import structure_factor_from_positions
 
 
@@ -123,13 +123,36 @@ def diffraction_simulation(crystal: Crystal,
     all_b_isos = []
     
     if use_symmetry and len(crystal.atoms) > 0:
+        lattice_type = _get_lattice_type(crystal.space_group_number)
+        lattice_translations = _get_lattice_translations(lattice_type)
+        
+        has_diamond_glide = crystal.space_group_number in {227, 228}
+        diamond_glide_translations = [
+            np.array([0.0, 0.0, 0.0]),
+            np.array([0.25, 0.25, 0.25]),
+        ] if has_diamond_glide else [np.array([0.0, 0.0, 0.0])]
+        
+        point_group_symops = _get_point_group_symops(crystal.crystal_system, crystal.space_group_number)
+        
         for atom in crystal.atoms:
-            equiv_positions = generate_equivalent_positions(atom.frac_coord, sg.symops)
-            for pos in equiv_positions:
-                all_positions.append(pos)
-                all_elements.append(atom.element)
-                all_occupancies.append(atom.occupancy)
-                all_b_isos.append(atom.b_iso)
+            full_positions = []
+            for dg_trans in diamond_glide_translations:
+                for pg_op in point_group_symops:
+                    rotated = pg_op.apply(atom.frac_coord)
+                    shifted = (rotated + dg_trans) % 1.0
+                    for lt in lattice_translations:
+                        pos = (shifted + lt) % 1.0
+                        full_positions.append(pos)
+            
+            seen = set()
+            for pos in full_positions:
+                key = tuple(np.round(pos, 6))
+                if key not in seen:
+                    seen.add(key)
+                    all_positions.append(pos)
+                    all_elements.append(atom.element)
+                    all_occupancies.append(atom.occupancy)
+                    all_b_isos.append(atom.b_iso)
     else:
         for atom in crystal.atoms:
             all_positions.append(atom.frac_coord)
@@ -164,19 +187,27 @@ def diffraction_simulation(crystal: Crystal,
                 
                 intensity = np.abs(F)**2
                 
-                mult = multiplicity(h, k, l, crystal.crystal_system)
+                if intensity < 1e-10:
+                    continue
+                
+                ch, ck, cl = _canonicalize_hkl(h, k, l, crystal.crystal_system)
+                
+                key = (ch, ck, cl)
+                if key in unique_indices:
+                    continue
+                unique_indices.add(key)
+                
+                mult = multiplicity(ch, ck, cl, crystal.crystal_system)
                 
                 lp = lorentz_polarization_factor(two_theta)
                 
                 intensity *= mult * lp
                 
-                key = _get_unique_key(h, k, l, crystal.crystal_system)
-                if key in unique_indices:
+                if intensity < 1e-10:
                     continue
-                unique_indices.add(key)
                 
                 peak = DiffractionPeak(
-                    h=h, k=k, l=l,
+                    h=ch, k=ck, l=cl,
                     d=d,
                     two_theta=two_theta,
                     intensity=intensity,
@@ -194,7 +225,129 @@ def diffraction_simulation(crystal: Crystal,
             for peak in peaks:
                 peak.intensity = peak.intensity / max_intensity * 100.0
     
+    peaks = [p for p in peaks if p.intensity > 0.01]
+    
     return peaks
+
+
+def _get_point_group_symops(crystal_system: str, sg_number: int) -> List[SymmetryOperation]:
+    """
+    获取点群对称操作（不含晶格平移和滑移平移）
+    这些操作只包含纯旋转/反演，平移分量为0
+    """
+    if crystal_system == "cubic":
+        if sg_number in {195, 196, 197, 198, 199}:
+            return [parse_symop_xyz(s) for s in [
+                "x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+                "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+                "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+            ]]
+        elif sg_number in {200, 201, 202, 203, 204, 205, 206}:
+            return [parse_symop_xyz(s) for s in [
+                "x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+                "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+                "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+                "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
+                "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
+                "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x",
+            ]]
+        elif sg_number in {207, 208, 209, 210, 211, 212, 213, 214}:
+            return [parse_symop_xyz(s) for s in [
+                "x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+                "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+                "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+                "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
+                "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
+                "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x",
+            ]]
+        else:
+            return [parse_symop_xyz(s) for s in [
+                "x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+                "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+                "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+                "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
+                "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
+                "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x",
+            ]]
+    elif crystal_system == "hexagonal":
+        return [parse_symop_xyz(s) for s in [
+            "x,y,z", "-y,x-y,z", "-x+y,-x,z", "-x,-y,z", "y,-x+y,z", "x-y,x,z",
+        ]]
+    elif crystal_system == "tetragonal":
+        return [parse_symop_xyz(s) for s in [
+            "x,y,z", "-x,-y,z", "-y,x,z", "y,-x,z",
+        ]]
+    elif crystal_system == "orthorhombic":
+        return [parse_symop_xyz(s) for s in [
+            "x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+        ]]
+    elif crystal_system == "monoclinic":
+        return [parse_symop_xyz(s) for s in [
+            "x,y,z", "-x,y,-z",
+        ]]
+    elif crystal_system == "triclinic":
+        return [parse_symop_xyz(s) for s in ["x,y,z"]]
+    
+    return [parse_symop_xyz("x,y,z")]
+
+
+def _get_lattice_translations(lattice_type: str) -> List[np.ndarray]:
+    """
+    获取晶格中心平移向量
+    
+    P: 无额外平移
+    I: + (1/2, 1/2, 1/2)
+    F: + (1/2, 1/2, 0), (1/2, 0, 1/2), (0, 1/2, 1/2)
+    C: + (1/2, 1/2, 0)
+    A: + (0, 1/2, 1/2)
+    R: + (2/3, 1/3, 1/3), (1/3, 2/3, 2/3) (六方设置)
+    """
+    base = [np.array([0.0, 0.0, 0.0])]
+    
+    if lattice_type == "P":
+        return base
+    elif lattice_type == "I":
+        return base + [np.array([0.5, 0.5, 0.5])]
+    elif lattice_type == "F":
+        return base + [
+            np.array([0.5, 0.5, 0.0]),
+            np.array([0.5, 0.0, 0.5]),
+            np.array([0.0, 0.5, 0.5]),
+        ]
+    elif lattice_type == "C":
+        return base + [np.array([0.5, 0.5, 0.0])]
+    elif lattice_type == "A":
+        return base + [np.array([0.0, 0.5, 0.5])]
+    elif lattice_type == "R":
+        return base + [
+            np.array([2/3, 1/3, 1/3]),
+            np.array([1/3, 2/3, 2/3]),
+        ]
+    return base
+
+
+def _canonicalize_hkl(h: int, k: int, l: int, crystal_system: str) -> Tuple[int, int, int]:
+    """
+    将(hkl)规范化为晶体学惯例的正指标表示
+    粉末衍射中习惯用正指标标注
+    """
+    ah, ak, al = abs(h), abs(k), abs(l)
+    
+    if crystal_system == "cubic":
+        return tuple(sorted([ah, ak, al], reverse=True))
+    elif crystal_system == "tetragonal":
+        if ah >= ak:
+            return (ah, ak, al)
+        else:
+            return (ak, ah, al)
+    elif crystal_system in ("hexagonal", "trigonal"):
+        return (max(ah, ak), min(ah, ak), al)
+    elif crystal_system == "orthorhombic":
+        return (ah, ak, al)
+    elif crystal_system == "monoclinic":
+        return (ah, ak, al)
+    else:
+        return (ah, ak, al)
 
 
 def _get_unique_key(h: int, k: int, l: int, crystal_system: str) -> Tuple:
@@ -202,23 +355,7 @@ def _get_unique_key(h: int, k: int, l: int, crystal_system: str) -> Tuple:
     获取唯一反射的键，用于去重
     (只保留等效反射中的一个)
     """
-    h, k, l = abs(h), abs(k), abs(l)
-    
-    if crystal_system == "cubic":
-        return tuple(sorted([h, k, l], reverse=True))
-    elif crystal_system == "tetragonal":
-        if h >= k:
-            return (h, k, l)
-        else:
-            return (k, h, l)
-    elif crystal_system == "hexagonal" or crystal_system == "trigonal":
-        return (max(h, k), min(h, k), l)
-    elif crystal_system == "orthorhombic":
-        return (h, k, l)
-    elif crystal_system == "monoclinic":
-        return (h, k, l)
-    else:
-        return (h, k, l)
+    return _canonicalize_hkl(h, k, l, crystal_system)
 
 
 def powder_pattern(peaks: List[DiffractionPeak],

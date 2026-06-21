@@ -157,77 +157,230 @@ def check_systematic_extinction(h: int, k: int, l: int, sg_number: int) -> bool:
     """
     检查系统消光规则
     返回True表示该反射被消光
+    
+    基于晶格中心类型和滑移面/螺旋轴的消光条件判定
     """
     if sg_number == 1:
         return False
 
-    if sg_number in [3, 4]:
-        if h != 0 and l != 0 and (h + l) % 2 != 0:
-            pass
-        return False
-
-    if sg_number in [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]:
-        if sg_number in [5, 6, 7, 8]:
-            if l % 2 != 0:
-                return True
-        elif sg_number in [9, 10, 11, 12]:
-            if (h + l) % 2 != 0:
-                return True
-
-    if sg_number in [16, 17, 18, 19, 20, 21, 22, 23, 24]:
-        pass
-    elif sg_number in [25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]:
-        if h + k + l % 2 != 0:
-            if sg_number in [25, 26, 27, 28, 29, 30, 31, 32, 33, 34]:
-                pass
-            elif sg_number in [35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46]:
-                if h % 2 != 0 or k % 2 != 0 or l % 2 != 0:
-                    return True
-    elif 47 <= sg_number <= 74:
-        if (h + k + l) % 2 != 0:
-            return True
-
+    if sg_number == 227:
+        return _check_fd3m_extinction(h, k, l)
+    elif sg_number == 225:
+        return _check_fm3m_extinction(h, k, l)
+    elif sg_number == 221:
+        return _check_pm3m_extinction(h, k, l)
+    elif sg_number == 229:
+        return _check_im3m_extinction(h, k, l)
+    elif sg_number == 194:
+        return _check_p63mmc_extinction(h, k, l)
+    
+    lattice_type = _get_lattice_type(sg_number)
+    
+    if _check_lattice_extinction(h, k, l, lattice_type):
+        return True
+    
     if 75 <= sg_number <= 142:
-        if 75 <= sg_number <= 88:
-            pass
-        elif 89 <= sg_number <= 98:
-            if h % 2 != 0 or k % 2 != 0:
-                return True
-        elif 99 <= sg_number <= 110:
-            if (h + k) % 2 != 0:
-                return True
-        elif 111 <= sg_number <= 122:
-            pass
-        elif 123 <= sg_number <= 142:
-            if (h + k + l) % 2 != 0:
-                return True
-
-    if 168 <= sg_number <= 194:
-        if 168 <= sg_number <= 173:
-            pass
-        elif 174 <= sg_number <= 194:
-            if (h + 2 * k) % 3 != 0 and l == 0:
-                pass
-            pass
-
-    if 195 <= sg_number <= 230:
-        if 195 <= sg_number <= 206:
-            if (h + k + l) % 2 != 0:
-                return True
-        elif 207 <= sg_number <= 220:
-            if h % 2 != 0 or k % 2 != 0 or l % 2 != 0:
-                return True
-        elif 221 <= sg_number <= 230:
-            if not all_even_or_all_odd(h, k, l):
-                return True
-
+        return _check_tetragonal_extinction(h, k, l, sg_number)
+    
+    if 16 <= sg_number <= 74:
+        return _check_orthorhombic_extinction(h, k, l, sg_number)
+    
+    if 3 <= sg_number <= 15:
+        return _check_monoclinic_extinction(h, k, l, sg_number)
+    
     return False
 
 
-def all_even_or_all_odd(h, k, l):
-    all_even = (h % 2 == 0 and k % 2 == 0 and l % 2 == 0)
-    all_odd = (h % 2 != 0 and k % 2 != 0 and l % 2 != 0)
-    return all_even or all_odd
+def _get_lattice_type(sg_number: int) -> str:
+    """根据空间群编号获取晶格中心类型"""
+    if sg_number in _P_GROUPS:
+        return "P"
+    elif sg_number in _I_GROUPS:
+        return "I"
+    elif sg_number in _F_GROUPS:
+        return "F"
+    elif sg_number in _C_GROUPS:
+        return "C"
+    elif sg_number in _A_GROUPS:
+        return "A"
+    elif sg_number in _R_GROUPS:
+        return "R"
+    return "P"
+
+
+_P_GROUPS = (
+    set(range(1, 3))
+    | set(range(3, 6))
+    | {6, 7, 8}
+    | set(range(16, 75))
+    | set(range(75, 89))
+    | set(range(143, 148))
+    | set(range(168, 174))
+    | set(range(195, 199))
+)
+
+_I_GROUPS = {
+    14, 23, 24,
+    44, 45, 46,
+    71, 72, 73, 74,
+    79, 80, 82, 87, 88,
+    97, 98, 107, 108, 109, 110,
+    121, 122,
+    139, 140, 141, 142,
+    148, 155, 160, 161, 166, 167,
+    197, 199, 204, 206,
+    211, 214, 217, 220,
+    229, 230,
+}
+
+_F_GROUPS = {
+    16, 17, 18, 19, 20, 21, 22, 23,
+    42, 43,
+    69, 70,
+    225, 226, 227, 228,
+    196, 202, 203, 209,
+    216, 219,
+}
+
+_C_GROUPS = {
+    5, 9, 10, 11, 12, 15,
+    20, 21, 35, 36, 37, 38, 39, 40, 41,
+    63, 64, 65, 66, 67, 68,
+}
+
+_A_GROUPS = {
+    38, 39, 40, 41,
+}
+
+_R_GROUPS = {
+    146, 148, 155, 160, 161, 166, 167,
+}
+
+
+def _check_lattice_extinction(h: int, k: int, l: int, lattice_type: str) -> bool:
+    """
+    检查晶格中心类型引起的系统消光
+    
+    P: 无消光
+    I: h+k+l = 奇数时消光
+    F: h,k,l 不全奇不全偶时消光
+    C: h+k = 奇数时消光
+    A: k+l = 奇数时消光
+    R (六方): h-k = 3n外消光 (简化处理)
+    """
+    if lattice_type == "P":
+        return False
+    elif lattice_type == "I":
+        if (h + k + l) % 2 != 0:
+            return True
+    elif lattice_type == "F":
+        if not _all_even_or_all_odd(h, k, l):
+            return True
+    elif lattice_type == "C":
+        if (h + k) % 2 != 0:
+            return True
+    elif lattice_type == "A":
+        if (k + l) % 2 != 0:
+            return True
+    elif lattice_type == "R":
+        if (-h + k + l) % 3 != 0:
+            return True
+    return False
+
+
+def _all_even_or_all_odd(h: int, k: int, l: int) -> bool:
+    """h,k,l全偶或全奇"""
+    parities = (h % 2, k % 2, l % 2)
+    return parities == (0, 0, 0) or parities == (1, 1, 1)
+
+
+def _check_fd3m_extinction(h: int, k: int, l: int) -> bool:
+    """
+    Fd-3m (#227) 消光规则
+    F面心: hkl不全奇不全偶 → 消光
+    金刚石滑移d: h+k+l = 4n+2 (即不全奇时已消光，全奇时 h+k+l=3+6n=3(1+2n) 为奇也消光,
+                全偶时 h+k+l=4n+2 消光)
+    
+    简化: F面心要求全奇或全偶;
+          全偶时 h+k+l=4n 才允许, h+k+l=4n+2 消光(d滑移)
+          全奇时全部允许
+    """
+    if not _all_even_or_all_odd(h, k, l):
+        return True
+    
+    if h % 2 == 0 and k % 2 == 0 and l % 2 == 0:
+        if (h + k + l) % 4 != 0:
+            return True
+    
+    return False
+
+
+def _check_fm3m_extinction(h: int, k: int, l: int) -> bool:
+    """
+    Fm-3m (#225) 消光规则
+    F面心: hkl不全奇不全偶 → 消光
+    """
+    if not _all_even_or_all_odd(h, k, l):
+        return True
+    return False
+
+
+def _check_pm3m_extinction(h: int, k: int, l: int) -> bool:
+    """
+    Pm-3m (#221) 消光规则
+    P简单格子: 无晶格消光
+    """
+    return False
+
+
+def _check_im3m_extinction(h: int, k: int, l: int) -> bool:
+    """
+    Im-3m (#229) 消光规则
+    I体心: h+k+l = 奇数 → 消光
+    """
+    if (h + k + l) % 2 != 0:
+        return True
+    return False
+
+
+def _check_p63mmc_extinction(h: int, k: int, l: int) -> bool:
+    """
+    P63/mmc (#194) 消光规则
+    P简单格子: 无晶格消光
+    63螺旋轴: l = 奇数时 h+2k=3n 的反射消光 (简化)
+    """
+    if l % 2 != 0:
+        if (h + 2 * k) % 3 != 0:
+            return True
+    return False
+
+
+def _check_tetragonal_extinction(h: int, k: int, l: int, sg_number: int) -> bool:
+    """四方晶系消光规则"""
+    if sg_number in {89, 90, 91, 92, 93, 94, 95, 96, 97, 98}:
+        if h % 2 != 0 or k % 2 != 0:
+            if l == 0:
+                return True
+    elif sg_number in {99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110}:
+        if (h + k) % 2 != 0:
+            if l == 0:
+                return True
+    elif sg_number in {123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142}:
+        if (h + k + l) % 2 != 0:
+            return True
+    return False
+
+
+def _check_orthorhombic_extinction(h: int, k: int, l: int, sg_number: int) -> bool:
+    """正交晶系消光规则"""
+    lattice = _get_lattice_type(sg_number)
+    return _check_lattice_extinction(h, k, l, lattice)
+
+
+def _check_monoclinic_extinction(h: int, k: int, l: int, sg_number: int) -> bool:
+    """单斜晶系消光规则"""
+    lattice = _get_lattice_type(sg_number)
+    return _check_lattice_extinction(h, k, l, lattice)
 
 
 def multiplicity(h: int, k: int, l: int, crystal_system: str) -> int:
@@ -364,30 +517,82 @@ SPACE_GROUP_SYMOPS = {
           "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
           "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
           "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x"],
-    225: ["x,y,z", "x+1/2,y+1/2,z", "x+1/2,y,z+1/2", "x,y+1/2,z+1/2",
-          "-x,-y,z", "-x+1/2,-y+1/2,z", "-x+1/2,-y,z+1/2", "-x,-y+1/2,z+1/2",
-          "-x,y,-z", "-x+1/2,y+1/2,-z", "-x+1/2,y,-z+1/2", "-x,y+1/2,-z+1/2",
-          "x,-y,-z", "x+1/2,-y+1/2,-z", "x+1/2,-y,-z+1/2", "x,-y+1/2,-z+1/2",
-          "z,x,y", "z+1/2,x+1/2,y", "z+1/2,x,y+1/2", "z,x+1/2,y+1/2",
-          "-z,-x,y", "-z+1/2,-x+1/2,y", "-z+1/2,-x,y+1/2", "-z,-x+1/2,y+1/2",
-          "-z,x,-y", "-z+1/2,x+1/2,-y", "-z+1/2,x,-y+1/2", "-z,x+1/2,-y+1/2",
-          "z,-x,-y", "z+1/2,-x+1/2,-y", "z+1/2,-x,-y+1/2", "z,-x+1/2,-y+1/2",
-          "y,z,x", "y+1/2,z+1/2,x", "y+1/2,z,x+1/2", "y,z+1/2,x+1/2",
-          "-y,-z,x", "-y+1/2,-z+1/2,x", "-y+1/2,-z,x+1/2", "-y,-z+1/2,x+1/2",
-          "-y,z,-x", "-y+1/2,z+1/2,-x", "-y+1/2,z,-x+1/2", "-y,z+1/2,-x+1/2",
-          "y,-z,-x", "y+1/2,-z+1/2,-x", "y+1/2,-z,-x+1/2", "y,-z+1/2,-x+1/2",
-          "-x,-y,-z", "-x+1/2,-y+1/2,-z", "-x+1/2,-y,-z+1/2", "-x,-y+1/2,-z+1/2",
-          "x,y,-z", "x+1/2,y+1/2,-z", "x+1/2,y,-z+1/2", "x,y+1/2,-z+1/2",
-          "x,-y,z", "x+1/2,-y+1/2,z", "x+1/2,-y,z+1/2", "x,-y+1/2,z+1/2",
-          "-x,y,z", "-x+1/2,y+1/2,z", "-x+1/2,y,z+1/2", "-x,y+1/2,z+1/2",
-          "-z,-x,-y", "-z+1/2,-x+1/2,-y", "-z+1/2,-x,-y+1/2", "-z,-x+1/2,-y+1/2",
-          "z,x,-y", "z+1/2,x+1/2,-y", "z+1/2,x,-y+1/2", "z,x+1/2,-y+1/2",
-          "z,-x,y", "z+1/2,-x+1/2,y", "z+1/2,-x,y+1/2", "z,-x+1/2,y+1/2",
-          "-z,x,y", "-z+1/2,x+1/2,y", "-z+1/2,x,y+1/2", "-z,x+1/2,y+1/2",
-          "-y,-z,-x", "-y+1/2,-z+1/2,-x", "-y+1/2,-z,-x+1/2", "-y,-z+1/2,-x+1/2",
-          "y,z,-x", "y+1/2,z+1/2,-x", "y+1/2,z,-x+1/2", "y,z+1/2,-x+1/2",
-          "y,-z,x", "y+1/2,-z+1/2,x", "y+1/2,-z,x+1/2", "y,-z+1/2,x+1/2",
-          "-y,z,x", "-y+1/2,z+1/2,x", "-y+1/2,z,x+1/2", "-y,z+1/2,x+1/2"],
+    225: ["x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+          "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+          "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+          "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
+          "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
+          "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x",
+          "x+1/2,y+1/2,z", "-x+1/2,-y+1/2,z", "-x+1/2,y+1/2,-z", "x+1/2,-y+1/2,-z",
+          "z+1/2,x+1/2,y", "-z+1/2,-x+1/2,y", "-z+1/2,x+1/2,-y", "z+1/2,-x+1/2,-y",
+          "y+1/2,z+1/2,x", "-y+1/2,-z+1/2,x", "-y+1/2,z+1/2,-x", "y+1/2,-z+1/2,-x",
+          "-x+1/2,-y+1/2,-z", "x+1/2,y+1/2,-z", "x+1/2,-y+1/2,z", "-x+1/2,y+1/2,z",
+          "-z+1/2,-x+1/2,-y", "z+1/2,x+1/2,-y", "z+1/2,-x+1/2,y", "-z+1/2,x+1/2,y",
+          "-y+1/2,-z+1/2,-x", "y+1/2,z+1/2,-x", "y+1/2,-z+1/2,x", "-y+1/2,z+1/2,x",
+          "x+1/2,y,z+1/2", "-x+1/2,-y,z+1/2", "-x+1/2,y,-z+1/2", "x+1/2,-y,-z+1/2",
+          "z+1/2,x,y+1/2", "-z+1/2,-x,y+1/2", "-z+1/2,x,-y+1/2", "z+1/2,-x,-y+1/2",
+          "y+1/2,z,x+1/2", "-y+1/2,-z,x+1/2", "-y+1/2,z,-x+1/2", "y+1/2,-z,-x+1/2",
+          "-x+1/2,-y,-z+1/2", "x+1/2,y,-z+1/2", "x+1/2,-y,z+1/2", "-x+1/2,y,z+1/2",
+          "-z+1/2,-x,-y+1/2", "z+1/2,x,-y+1/2", "z+1/2,-x,y+1/2", "-z+1/2,x,y+1/2",
+          "-y+1/2,-z,-x+1/2", "y+1/2,z,-x+1/2", "y+1/2,-z,x+1/2", "-y+1/2,z,x+1/2",
+          "x,y+1/2,z+1/2", "-x,-y+1/2,z+1/2", "-x,y+1/2,-z+1/2", "x,-y+1/2,-z+1/2",
+          "z,x+1/2,y+1/2", "-z,-x+1/2,y+1/2", "-z,x+1/2,-y+1/2", "z,-x+1/2,-y+1/2",
+          "y,z+1/2,x+1/2", "-y,-z+1/2,x+1/2", "-y,z+1/2,-x+1/2", "y,-z+1/2,-x+1/2",
+          "-x,-y+1/2,-z+1/2", "x,y+1/2,-z+1/2", "x,-y+1/2,z+1/2", "-x,y+1/2,z+1/2",
+          "-z,-x+1/2,-y+1/2", "z,x+1/2,-y+1/2", "z,-x+1/2,y+1/2", "-z,x+1/2,y+1/2",
+          "-y,-z+1/2,-x+1/2", "y,z+1/2,-x+1/2", "y,-z+1/2,x+1/2", "-y,z+1/2,x+1/2"],
+    227: ["x,y,z", "-x,-y,-z",
+          "-y,z,-x", "y,-z,x",
+          "-z,x,-y", "z,-x,y",
+          "y,z,x", "-y,-z,-x",
+          "z,x,y", "-z,-x,-y",
+          "x+1/2,y+1/2,z", "-x+1/2,-y+1/2,-z",
+          "-y+1/2,z+1/2,-x", "y+1/2,-z+1/2,x",
+          "-z+1/2,x+1/2,-y", "z+1/2,-x+1/2,y",
+          "y+1/2,z+1/2,x", "-y+1/2,-z+1/2,-x",
+          "z+1/2,x+1/2,y", "-z+1/2,-x+1/2,-y",
+          "x+1/2,y,z+1/2", "-x+1/2,-y,-z+1/2",
+          "-y+1/2,z,-x+1/2", "y+1/2,-z,x+1/2",
+          "-z+1/2,x,-y+1/2", "z+1/2,-x,y+1/2",
+          "y+1/2,z,x+1/2", "-y+1/2,-z,-x+1/2",
+          "z+1/2,x,y+1/2", "-z+1/2,-x,-y+1/2",
+          "x,y+1/2,z+1/2", "-x,-y+1/2,-z+1/2",
+          "-y,z+1/2,-x+1/2", "y,-z+1/2,x+1/2",
+          "-z,x+1/2,-y+1/2", "z,-x+1/2,y+1/2",
+          "y,z+1/2,x+1/2", "-y,-z+1/2,-x+1/2",
+          "z,x+1/2,y+1/2", "-z,-x+1/2,-y+1/2",
+          "x+3/4,y+1/4,z+3/4", "-x+3/4,-y+1/4,-z+3/4",
+          "-y+3/4,z+1/4,-x+3/4", "y+3/4,-z+1/4,x+3/4",
+          "-z+3/4,x+1/4,-y+3/4", "z+3/4,-x+1/4,y+3/4",
+          "y+3/4,z+1/4,x+3/4", "-y+3/4,-z+1/4,-x+3/4",
+          "z+3/4,x+1/4,y+3/4", "-z+3/4,-x+1/4,-y+3/4",
+          "x+1/4,y+3/4,z+1/4", "-x+1/4,-y+3/4,-z+1/4",
+          "-y+1/4,z+3/4,-x+1/4", "y+1/4,-z+3/4,x+1/4",
+          "-z+1/4,x+3/4,-y+1/4", "z+1/4,-x+3/4,y+1/4",
+          "y+1/4,z+3/4,x+1/4", "-y+1/4,-z+3/4,-x+1/4",
+          "z+1/4,x+3/4,y+1/4", "-z+1/4,-x+3/4,-y+1/4",
+          "x+1/4,y+1/4,z+1/4", "-x+1/4,-y+1/4,-z+1/4",
+          "-y+1/4,z+1/4,-x+1/4", "y+1/4,-z+1/4,x+1/4",
+          "-z+1/4,x+1/4,-y+1/4", "z+1/4,-x+1/4,y+1/4",
+          "y+1/4,z+1/4,x+1/4", "-y+1/4,-z+1/4,-x+1/4",
+          "z+1/4,x+1/4,y+1/4", "-z+1/4,-x+1/4,-y+1/4",
+          "x+3/4,y+3/4,z+3/4", "-x+3/4,-y+3/4,-z+3/4",
+          "-y+3/4,z+3/4,-x+3/4", "y+3/4,-z+3/4,x+3/4",
+          "-z+3/4,x+3/4,-y+3/4", "z+3/4,-x+3/4,y+3/4",
+          "y+3/4,z+3/4,x+3/4", "-y+3/4,-z+3/4,-x+3/4",
+          "z+3/4,x+3/4,y+3/4", "-z+3/4,-x+3/4,-y+3/4"],
+    229: ["x,y,z", "-x,-y,z", "-x,y,-z", "x,-y,-z",
+          "z,x,y", "-z,-x,y", "-z,x,-y", "z,-x,-y",
+          "y,z,x", "-y,-z,x", "-y,z,-x", "y,-z,-x",
+          "-x,-y,-z", "x,y,-z", "x,-y,z", "-x,y,z",
+          "-z,-x,-y", "z,x,-y", "z,-x,y", "-z,x,y",
+          "-y,-z,-x", "y,z,-x", "y,-z,x", "-y,z,x",
+          "x+1/2,y+1/2,z+1/2", "-x+1/2,-y+1/2,z+1/2", "-x+1/2,y+1/2,-z+1/2", "x+1/2,-y+1/2,-z+1/2",
+          "z+1/2,x+1/2,y+1/2", "-z+1/2,-x+1/2,y+1/2", "-z+1/2,x+1/2,-y+1/2", "z+1/2,-x+1/2,-y+1/2",
+          "y+1/2,z+1/2,x+1/2", "-y+1/2,-z+1/2,x+1/2", "-y+1/2,z+1/2,-x+1/2", "y+1/2,-z+1/2,-x+1/2",
+          "-x+1/2,-y+1/2,-z+1/2", "x+1/2,y+1/2,-z+1/2", "x+1/2,-y+1/2,z+1/2", "-x+1/2,y+1/2,z+1/2",
+          "-z+1/2,-x+1/2,-y+1/2", "z+1/2,x+1/2,-y+1/2", "z+1/2,-x+1/2,y+1/2", "-z+1/2,x+1/2,y+1/2",
+          "-y+1/2,-z+1/2,-x+1/2", "y+1/2,z+1/2,-x+1/2", "y+1/2,-z+1/2,x+1/2", "-y+1/2,z+1/2,x+1/2"],
 }
 
 
@@ -407,15 +612,15 @@ def get_sg_symbol(number: int) -> str:
     """根据空间群编号获取H-M符号"""
     sg_symbols = {
         1: "P1", 2: "P-1",
-        3: "P2", 4: "P2", 5: "C2",
+        3: "P2", 4: "P21", 5: "C2",
         14: "P2/c", 15: "C2/c",
-        16: "P222", 19: "P222",
+        16: "P222", 19: "F222",
         47: "Pmmm", 62: "Pnma",
-        75: "P4", 81: "P4",
-        89: "P422", 99: "P422",
+        75: "P4", 81: "P41",
+        89: "P422", 99: "P4122",
         123: "P4/mmm", 129: "P4/nmm",
         141: "I41/amd",
-        143: "P3", 147: "P3",
+        143: "P3", 147: "P31",
         150: "P321", 155: "R3",
         160: "R3c",
         168: "P6", 173: "P63",
@@ -423,7 +628,7 @@ def get_sg_symbol(number: int) -> str:
         194: "P63/mmc",
         195: "P23", 200: "Pm-3",
         207: "F23", 221: "Pm-3m",
-        225: "Fm-3m", 229: "Im-3m",
+        225: "Fm-3m", 227: "Fd-3m", 229: "Im-3m",
     }
     return sg_symbols.get(number, f"SG_{number}")
 
@@ -434,11 +639,11 @@ def get_sg_number(symbol: str) -> int:
         "P1": 1, "P-1": 2,
         "P2": 3, "P21": 4, "C2": 5,
         "P2/c": 14, "C2/c": 15,
-        "P222": 16,
+        "P222": 16, "F222": 19,
         "Pmmm": 47, "Pnma": 62,
         "P4/mmm": 123, "P4/nmm": 129,
         "I41/amd": 141,
         "P63/mmc": 194,
-        "Pm-3m": 221, "Fm-3m": 225, "Im-3m": 229,
+        "Pm-3m": 221, "Fm-3m": 225, "Fd-3m": 227, "Im-3m": 229,
     }
     return sg_numbers.get(symbol, 1)

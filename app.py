@@ -100,7 +100,6 @@ def create_default_crystal() -> Crystal:
         name="硅 (Si)"
     )
     crystal.add_atom("Si", 0.0, 0.0, 0.0, occupancy=1.0, b_iso=0.5)
-    crystal.add_atom("Si", 0.25, 0.25, 0.25, occupancy=1.0, b_iso=0.5)
     return crystal
 
 
@@ -423,7 +422,8 @@ def diffraction_simulation_section():
                 use_symmetry=True
             )
             st.session_state.peaks_data = peaks
-            st.success(f"计算完成，共 {len(peaks)} 个衍射峰")
+            st.session_state.lebail_result = None
+            st.rerun()
     
     if st.session_state.peaks_data is not None:
         peaks = st.session_state.peaks_data
@@ -469,10 +469,11 @@ def diffraction_simulation_section():
                     fig.add_annotation(
                         x=peak.two_theta,
                         y=peak.intensity + 2,
-                        text=f"({peak.h}{peak.k}{peak.l})",
+                        text=f"({peak.h}{peak.k}{peak.l})<br>d={peak.d:.3f}",
                         showarrow=False,
-                        font=dict(size=9),
-                        textangle=-90
+                        font=dict(size=8),
+                        textangle=-90,
+                        yshift=10
                     )
             
             fig.update_layout(
@@ -491,6 +492,8 @@ def diffraction_simulation_section():
             fig2 = go.Figure()
             
             for peak in peaks:
+                if peak.intensity <= 0.1:
+                    continue
                 fig2.add_trace(go.Scatter(
                     x=[peak.two_theta, peak.two_theta],
                     y=[0, peak.intensity],
@@ -515,15 +518,17 @@ def diffraction_simulation_section():
         with tab3:
             peak_data = []
             for peak in peaks:
-                peak_data.append({
-                    'h': peak.h,
-                    'k': peak.k,
-                    'l': peak.l,
-                    '2θ (°)': round(peak.two_theta, 4),
-                    'd (Å)': round(peak.d, 4),
-                    '强度 (%)': round(peak.intensity, 2),
-                    '多重性': peak.multiplicity
-                })
+                if peak.intensity > 0.1:
+                    peak_data.append({
+                        'h': peak.h,
+                        'k': peak.k,
+                        'l': peak.l,
+                        'hkl': f"({peak.h}{peak.k}{peak.l})",
+                        '2θ (°)': round(peak.two_theta, 4),
+                        'd (Å)': round(peak.d, 4),
+                        '强度 (%)': round(peak.intensity, 2),
+                        '多重性': peak.multiplicity
+                    })
             
             df = pd.DataFrame(peak_data)
             st.dataframe(df, use_container_width=True, height=400)

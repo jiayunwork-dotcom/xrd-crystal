@@ -20,4 +20,3 @@ _atom_site_fract_z
 _atom_site_occupancy
 _atom_site_B_iso_or_equiv
 Si Si 0.0 0.0 0.0 1.0 0.5
-Si Si 0.25 0.25 0.25 1.0 0.5
