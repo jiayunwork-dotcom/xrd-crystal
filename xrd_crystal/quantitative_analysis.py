@@ -4,7 +4,7 @@
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 from dataclasses import dataclass, field
 from scipy.optimize import least_squares
 
@@ -43,6 +43,7 @@ class QuantitativeResult:
     observed_intensity: np.ndarray
     difference_pattern: np.ndarray
     removed_phases: List[str] = field(default_factory=list)
+    rwp_history: List[float] = field(default_factory=list)
 
 
 def _polynomial_background(x: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
@@ -148,37 +149,25 @@ def _calculate_chi_squared(
     return np.sum(weights * (y_obs - y_calc) ** 2) / dof
 
 
-def _residuals(
+def _compute_pattern_from_params(
     params: np.ndarray,
-    phase_patterns: List[np.ndarray],
-    observed: np.ndarray,
-    bg_order: int
+    phase_patterns_list: List[np.ndarray],
+    intensity_norm: np.ndarray,
+    x_normalized: np.ndarray
 ) -> np.ndarray:
     """
-    计算残差向量 (用于最小二乘优化)
-    
-    参数:
-        params: [w1, w2, ..., wn, c0, c1, ..., cm]
-                前n个是各相权重，后m+1个是多项式背景系数
-        phase_patterns: 各相归一化理论谱列表
-        observed: 实验强度
-        bg_order: 背景多项式阶数
+    根据参数向量计算总拟合谱（包含背景）
     """
-    n_phases = len(phase_patterns)
-    weights = params[:n_phases]
-    bg_coeffs = params[n_phases:]
+    n_p = len(phase_patterns_list)
+    weights = params[:n_p]
+    bg_coeffs = params[n_p:]
     
-    calculated = np.zeros_like(observed)
-    for w, pattern in zip(weights, phase_patterns):
+    calculated = np.zeros_like(intensity_norm)
+    for w, pattern in zip(weights, phase_patterns_list):
         calculated += w * pattern
+    calculated += _polynomial_background(x_normalized, bg_coeffs)
     
-    calculated += _polynomial_background(observed if False else np.arange(len(observed)), bg_coeffs)
-    
-    valid = observed > 0
-    weights_w = np.zeros_like(observed)
-    weights_w[valid] = 1.0 / np.maximum(observed[valid], 1e-6)
-    
-    return (observed - calculated) * np.sqrt(weights_w)
+    return calculated
 
 
 def quantitative_analysis(
@@ -194,7 +183,8 @@ def quantitative_analysis(
     eta: float = 0.5,
     background_order: int = 3,
     max_iterations: int = 200,
-    tolerance: float = 1e-6
+    tolerance: float = 1e-6,
+    progress_callback: Optional[Callable[[int, int, float], None]] = None
 ) -> QuantitativeResult:
     """
     多相混合物定量分析
@@ -211,6 +201,7 @@ def quantitative_analysis(
         background_order: 多项式背景阶数 (2-5)
         max_iterations: 最大迭代次数
         tolerance: 收敛阈值
+        progress_callback: 进度回调函数 (当前迭代, 最大迭代, 当前Rwp) -> None
     
     返回:
         QuantitativeResult对象
@@ -223,6 +214,12 @@ def quantitative_analysis(
     phase_names = list(selected_crystals.keys())
     current_phases = phase_names.copy()
     removed_phases = []
+    rwp_history = []
+    
+    x_normalized = np.linspace(0, 1, len(two_theta))
+    
+    total_phases_initial = len(phase_names)
+    phase_elimination_round = 0
     
     while True:
         current_crystals = {name: selected_crystals[name] for name in current_phases}
@@ -253,37 +250,41 @@ def quantitative_analysis(
         upper_bounds = np.inf * np.ones(n_params_total)
         
         def residuals_func(p):
-            return _residuals(p, phase_patterns_list, intensity_norm, background_order)
-        
-        x_normalized = np.linspace(0, 1, len(two_theta))
-        
-        def residuals_func_v2(p):
-            n_p = len(phase_patterns_list)
-            weights = p[:n_p]
-            bg_coeffs = p[n_p:]
-            
-            calculated = np.zeros_like(intensity_norm)
-            for w, pattern in zip(weights, phase_patterns_list):
-                calculated += w * pattern
-            
-            calculated += _polynomial_background(x_normalized, bg_coeffs)
-            
+            calculated = _compute_pattern_from_params(
+                p, phase_patterns_list, intensity_norm, x_normalized
+            )
             valid = intensity_norm > 0
             w_vec = np.zeros_like(intensity_norm)
             w_vec[valid] = 1.0 / np.maximum(intensity_norm[valid], 1e-6)
-            
             return (intensity_norm - calculated) * np.sqrt(w_vec)
+        
+        callback_nfev = [0]
+        def least_squares_callback(xk, info):
+            callback_nfev[0] += 1
+            current_calc = _compute_pattern_from_params(
+                xk, phase_patterns_list, intensity_norm, x_normalized
+            )
+            current_rwp = _calculate_Rwp(intensity_norm, current_calc)
+            rwp_history.append(current_rwp)
+            if progress_callback is not None:
+                overall_iter = callback_nfev[0] + phase_elimination_round * (max_iterations // 4)
+                overall_max = max_iterations * total_phases_initial
+                try:
+                    progress_callback(min(overall_iter, overall_max), overall_max, current_rwp)
+                except Exception:
+                    pass
         
         try:
             result = least_squares(
-                residuals_func_v2,
+                residuals_func,
                 params0,
                 bounds=(lower_bounds, upper_bounds),
                 method='trf',
                 max_nfev=max_iterations,
                 ftol=tolerance,
                 xtol=tolerance,
-                gtol=tolerance
+                gtol=tolerance,
+                callback=least_squares_callback
             )
             
             opt_params = result.x
@@ -307,6 +308,7 @@ def quantitative_analysis(
         if not phases_to_remove:
             break
         
+        phase_elimination_round += 1
         for _, name in reversed(phases_to_remove):
             removed_phases.append(name)
             current_phases.remove(name)
@@ -327,7 +329,6 @@ def quantitative_analysis(
             pattern = pattern / max_p * 100.0
         final_patterns_list.append(pattern)
     
-    x_normalized = np.linspace(0, 1, len(two_theta))
     opt_weights = opt_params[:n_phases]
     opt_bg_coeffs = opt_params[n_phases:]
     
@@ -354,6 +355,7 @@ def quantitative_analysis(
     else:
         mass_percents = np.ones(n_phases) / n_phases * 100.0
     
+    cov_ok = False
     try:
         J = result.jac
         if J is not None and J.shape[0] > J.shape[1]:
@@ -362,14 +364,38 @@ def quantitative_analysis(
                 cov = np.linalg.inv(JtJ)
                 s2 = np.sum(result.fun ** 2) / max(len(result.fun) - len(opt_params), 1)
                 param_std = np.sqrt(np.maximum(np.diag(cov) * s2, 0))
+                if np.all(np.isfinite(param_std)) and not np.all(param_std == 0):
+                    cov_ok = True
             except np.linalg.LinAlgError:
-                param_std = np.zeros_like(opt_params)
+                param_std = np.full_like(opt_params, np.nan)
         else:
-            param_std = np.zeros_like(opt_params)
+            param_std = np.full_like(opt_params, np.nan)
     except Exception:
-        param_std = np.zeros_like(opt_params)
+        param_std = np.full_like(opt_params, np.nan)
     
-    weight_std = param_std[:n_phases]
+    if not cov_ok:
+        try:
+            J_approx = np.zeros((len(intensity_norm), len(opt_params)))
+            eps = 1e-8
+            base_resid = residuals_func(opt_params)
+            for j in range(len(opt_params)):
+                p_pert = opt_params.copy()
+                step = max(abs(opt_params[j]) * eps, eps)
+                p_pert[j] += step
+                pert_resid = residuals_func(p_pert)
+                J_approx[:, j] = (pert_resid - base_resid) / step
+            
+            JtJ = J_approx.T @ J_approx
+            try:
+                cov = np.linalg.inv(JtJ + 1e-10 * np.eye(len(opt_params)))
+                s2 = np.sum(base_resid ** 2) / max(len(base_resid) - len(opt_params), 1)
+                param_std = np.sqrt(np.maximum(np.diag(cov) * s2, 0))
+            except np.linalg.LinAlgError:
+                param_std = np.full_like(opt_params, np.nan)
+        except Exception:
+            param_std = np.full_like(opt_params, np.nan)
+    
+    weight_std = param_std[:n_phases] if len(param_std) == len(opt_params) else np.full(n_phases, np.nan)
     
     rwp_contributions = {}
     for idx, name in enumerate(current_phases):
@@ -395,7 +421,7 @@ def quantitative_analysis(
             space_group=crystal.space_group,
             space_group_number=crystal.space_group_number,
             weight=float(opt_weights[i]),
-            weight_std=float(weight_std[i]),
+            weight_std=float(weight_std[i]) if i < len(weight_std) and np.isfinite(weight_std[i]) else float('nan'),
             mass_percent=float(mass_percents[i]),
             rwp_contribution=float(rwp_contributions.get(name, 0.0))
         ))
@@ -415,5 +441,6 @@ def quantitative_analysis(
         two_theta=two_theta,
         observed_intensity=intensity_norm,
         difference_pattern=difference,
-        removed_phases=removed_phases
+        removed_phases=removed_phases,
+        rwp_history=rwp_history
     )

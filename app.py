@@ -1130,6 +1130,131 @@ def multiphase_section():
         st.plotly_chart(fig, use_container_width=True)
 
 
+def _quant_manual_crystal_input():
+    """定量分析页面内手动定义晶相"""
+    st.markdown("#### ✏️ 手动定义新晶相")
+    
+    with st.form("quant_manual_crystal_form"):
+        sg_input = st.text_input(
+            "空间群 (H-M符号或编号)",
+            value="Fd-3m",
+            help="例如: P1, Fm-3m, 225 等"
+        )
+        
+        try:
+            sg_num = int(sg_input)
+            sg_symbol = get_sg_symbol(sg_num)
+        except ValueError:
+            sg_symbol = sg_input
+            sg_num = get_sg_number(sg_input)
+        
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            qa = st.number_input("a (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_a")
+        with col_b:
+            qb = st.number_input("b (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_b")
+        with col_c:
+            qc = st.number_input("c (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_c")
+        
+        col_alpha, col_beta, col_gamma = st.columns(3)
+        with col_alpha:
+            qalpha = st.number_input("α (°)", value=90.0, step=0.1, format="%.2f", key="qa_alpha")
+        with col_beta:
+            qbeta = st.number_input("β (°)", value=90.0, step=0.1, format="%.2f", key="qa_beta")
+        with col_gamma:
+            qgamma = st.number_input("γ (°)", value=90.0, step=0.1, format="%.2f", key="qa_gamma")
+        
+        crystal_name_q = st.text_input("晶体名称", value="自定义晶体", key="qa_crystal_name")
+        
+        if 'qa_atom_list' not in st.session_state:
+            st.session_state.qa_atom_list = [
+                {"element": "Si", "x": 0.0, "y": 0.0, "z": 0.0, "occupancy": 1.0, "b_iso": 0.5},
+            ]
+        
+        st.markdown("**原子列表**")
+        atoms_to_del = []
+        for i, atom in enumerate(st.session_state.qa_atom_list):
+            with st.expander(f"原子 {i+1}: {atom['element']}", expanded=(i < 2)):
+                col_e, col_x, col_y = st.columns(3)
+                with col_e:
+                    atom['element'] = st.text_input("元素", value=atom['element'], key=f"qa_elem_{i}")
+                with col_x:
+                    atom['x'] = st.number_input("x", value=float(atom['x']), step=0.01, format="%.4f", key=f"qa_x_{i}")
+                with col_y:
+                    atom['y'] = st.number_input("y", value=float(atom['y']), step=0.01, format="%.4f", key=f"qa_y_{i}")
+                col_z, col_occ, col_b = st.columns(3)
+                with col_z:
+                    atom['z'] = st.number_input("z", value=float(atom['z']), step=0.01, format="%.4f", key=f"qa_z_{i}")
+                with col_occ:
+                    atom['occupancy'] = st.number_input("占位", value=float(atom['occupancy']), min_value=0.0, max_value=1.0, step=0.1, key=f"qa_occ_{i}")
+                with col_b:
+                    atom['b_iso'] = st.number_input("B_iso", value=float(atom['b_iso']), step=0.1, key=f"qa_b_{i}")
+                
+                if st.button(f"删除原子 {i+1}", key=f"qa_del_atom_{i}"):
+                    atoms_to_del.append(i)
+        
+        for idx in reversed(atoms_to_del):
+            st.session_state.qa_atom_list.pop(idx)
+        
+        col_add, col_submit = st.columns([1, 1])
+        with col_add:
+            if st.form_submit_button("➕ 添加原子"):
+                st.session_state.qa_atom_list.append({
+                    "element": "C", "x": 0.0, "y": 0.0, "z": 0.0,
+                    "occupancy": 1.0, "b_iso": 1.0
+                })
+                st.rerun()
+        
+        with col_submit:
+            submitted = st.form_submit_button("✅ 保存此晶相", type="primary")
+            if submitted:
+                if len(st.session_state.qa_atom_list) == 0:
+                    st.warning("请至少添加一个原子")
+                else:
+                    crystal_q = Crystal(
+                        a=qa, b=qb, c=qc,
+                        alpha=qalpha, beta=qbeta, gamma=qgamma,
+                        space_group=sg_symbol,
+                        space_group_number=sg_num,
+                        name=crystal_name_q
+                    )
+                    for atom_data in st.session_state.qa_atom_list:
+                        crystal_q.add_atom(
+                            atom_data['element'],
+                            atom_data['x'], atom_data['y'], atom_data['z'],
+                            atom_data['occupancy'],
+                            atom_data['b_iso']
+                        )
+                    
+                    phase_name_q = f"定量相_{len(st.session_state.phases) + 1}"
+                    st.session_state.crystals[phase_name_q] = crystal_q
+                    if phase_name_q not in st.session_state.phases:
+                        st.session_state.phases.append(phase_name_q)
+                        st.session_state.phase_ratios[phase_name_q] = 1.0
+                    
+                    st.success(f"已保存晶相: {phase_name_q} ({crystal_name_q}")
+                    st.rerun()
+
+
+def _format_weight_std(weight_std_value):
+    """格式化权重标准误差，处理NaN和极小值"""
+    is_invalid = (weight_std_value is None 
+                  or (isinstance(weight_std_value, float) and not np.isfinite(weight_std_value)))
+    if is_invalid:
+        return "⚠ 无法计算"
+    if isinstance(weight_std_value, float) and weight_std_value < 1e-6:
+        return f"< 1e-6 (极小)"
+    return f"{weight_std_value:.6f}"
+
+
+def _is_std_invalid(weight_std_value):
+    """检查标准误差是否无效（无法计算或极小）"""
+    is_invalid = (weight_std_value is None 
+                  or (isinstance(weight_std_value, float) and not np.isfinite(weight_std_value)))
+    is_tiny = isinstance(weight_std_value, float) and weight_std_value < 1e-6
+    return is_invalid or is_tiny
+
+
 def quantitative_analysis_section():
     """定量分析部分"""
     st.header("🔬 多相定量分析")
@@ -1196,11 +1321,15 @@ def quantitative_analysis_section():
         
         st.markdown("---")
         st.markdown("### 💎 晶相选择")
-        st.caption("选择2-4个已知晶相进行定量分析")
+        st.caption("从已有晶相库中选取，或手动定义新晶相 (需2-4个)")
         
+        with st.expander("➕ 手动定义新晶相", expanded=False):
+            _quant_manual_crystal_input()
+        
+        st.markdown("#### 已有晶相选择")
         available_phases = list(st.session_state.crystals.keys())
         if len(available_phases) == 0:
-            st.warning("暂无晶体相，请先在其他页面定义晶相")
+            st.warning("暂无晶体相，请在上方手动定义或切换到其他页面创建")
         else:
             for phase_name in available_phases:
                 crystal = st.session_state.crystals[phase_name]
@@ -1219,7 +1348,10 @@ def quantitative_analysis_section():
                     st.session_state.quant_selected_phases.remove(phase_name)
         
         n_selected = len(st.session_state.quant_selected_phases)
-        st.info(f"已选择 {n_selected} 个晶相 (需2-4个)")
+        if n_selected > 0:
+            st.info(f"✓ 已选择 {n_selected} 个晶相: {', '.join(st.session_state.quant_selected_phases)} (需2-4个)")
+        else:
+            st.info("目前未选择晶相 (需2-4个)")
         
         st.markdown("---")
         st.markdown("### ⚙️ 拟合参数")
@@ -1268,14 +1400,24 @@ def quantitative_analysis_section():
                 for phase_name in st.session_state.quant_selected_phases:
                     selected_crystals[phase_name] = st.session_state.crystals[phase_name]
                 
-                progress_bar = st.progress(0, text="正在准备计算...")
+                progress_bar = st.progress(0, text="初始化中...")
+                rwp_display = st.empty()
+                last_progress = [0]
+                
+                def on_progress(current_iter, max_iter, current_rwp):
+                    pct = max(min(int(current_iter / max(max_iter, 1) * 100), 100), 0)
+                    pct = max(pct, last_progress[0])
+                    last_progress[0] = pct
+                    progress_bar.progress(pct, text=f"迭代中... ({current_iter}/{max_iter})")
+                    rwp_display.caption(f"当前 Rwp = {current_rwp*100:.3f}%")
                 
                 try:
                     exp_data = st.session_state.quant_exp_data
                     two_theta = exp_data['two_theta']
                     intensity = exp_data['intensity']
                     
-                    progress_bar.progress(20, text="正在计算各相理论谱...")
+                    progress_bar.progress(5, text="正在计算各相理论谱...")
+                    rwp_display.caption("预处理中...")
                     
                     result = quantitative_analysis(
                         two_theta=two_theta,
@@ -1290,18 +1432,25 @@ def quantitative_analysis_section():
                         eta=st.session_state.eta,
                         background_order=bg_order,
                         max_iterations=max_iter,
-                        tolerance=tolerance
+                        tolerance=tolerance,
+                        progress_callback=on_progress
                     )
                     
-                    progress_bar.progress(100, text="计算完成!")
+                    progress_bar.progress(100, text="✅ 计算完成!")
+                    rwp_display.caption(f"最终 Rwp = {result.Rwp*100:.3f}% | 迭代 {result.iterations} 次")
                     st.session_state.quant_result = result
+                    
+                    from time import sleep
+                    sleep(0.5)
+                    progress_bar.empty()
+                    rwp_display.empty()
                     
                 except Exception as e:
                     st.error(f"定量分析失败: {e}")
                     import traceback
                     st.error(traceback.format_exc())
-                finally:
                     progress_bar.empty()
+                    rwp_display.empty()
     
     with col_right:
         if st.session_state.quant_result is None:
@@ -1325,19 +1474,26 @@ def quantitative_analysis_section():
             
             st.subheader("📊 定量结果")
             
+            has_std_warning = False
             result_data = []
             for pr in result.phase_results:
+                std_str = _format_weight_std(pr.weight_std)
+                has_std_warning = has_std_warning or _is_std_invalid(pr.weight_std)
+                weight_display = f"{pr.weight:.4f} ± {std_str}"
                 result_data.append({
                     '相名称': pr.phase_name,
                     '晶体名称': pr.crystal_name,
                     '空间群': f"{pr.space_group} (#{pr.space_group_number})",
-                    '权重因子': f"{pr.weight:.4f} ± {pr.weight_std:.4f}",
+                    '权重因子': weight_display,
                     '质量百分比 (%)': f"{pr.mass_percent:.2f}",
                     'Rwp贡献度': f"{pr.rwp_contribution*100:.3f}%"
                 })
             
             df_result = pd.DataFrame(result_data)
             st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            if has_std_warning:
+                st.caption("⚠️ 注意：部分权重标准误差标记为\"无法计算\"或\"极小\"的原因可能是：该相对拟合影响极小或参数空间高度相关；数值近似计算困难。可尝试增加迭代次数或调整收敛阈值以改善。")
             
             csv_buffer = io.StringIO()
             df_result.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
@@ -1353,6 +1509,28 @@ def quantitative_analysis_section():
             
             if result.removed_phases:
                 st.warning(f"以下晶相因含量过低(<1%)已自动剔除: {', '.join(result.removed_phases)}")
+            
+            rwp_hist = getattr(result, 'rwp_history', [])
+            if len(rwp_hist) > 1:
+                with st.expander("📉 Rwp收敛曲线", expanded=False):
+                    fig_rwp = go.Figure()
+                    iterations_x = list(range(1, len(rwp_hist) + 1))
+                    fig_rwp.add_trace(go.Scatter(
+                        x=iterations_x,
+                        y=[r*100 for r in rwp_hist],
+                        mode='lines+markers',
+                        name='Rwp',
+                        line=dict(color='#d62728', width=2),
+                        marker=dict(size=4)
+                    ))
+                    fig_rwp.update_layout(
+                        title="Rwp随迭代变化曲线",
+                        xaxis_title="迭代次数",
+                        yaxis_title="Rwp (%)",
+                        height=300,
+                        hovermode='x unified'
+                    )
+                    st.plotly_chart(fig_rwp, use_container_width=True)
             
             st.markdown("---")
             
@@ -1500,22 +1678,31 @@ def quantitative_analysis_section():
             with st.expander("📊 参数标准误差详情", expanded=False):
                 n_phases = len(result.phase_results)
                 bg_coeffs = result.background_coeffs
-                bg_std = result.param_std_errors[n_phases:]
+                bg_std = result.param_std_errors[n_phases:] if len(result.param_std_errors) == len(result.background_coeffs) + n_phases else []
                 
                 st.markdown("**各相权重标准误差:**")
+                has_bg_std_warning = False
                 for i, pr in enumerate(result.phase_results):
-                    st.write(f"- {pr.phase_name}: σ = {pr.weight_std:.6f}")
+                    fmt_std = _format_weight_std(pr.weight_std)
+                    st.write(f"- {pr.phase_name}: σ = {fmt_std}")
                 
                 st.markdown("**背景多项式系数 (c₀ + c₁x + c₂x² + ...):**")
                 bg_data = []
-                for i, (coeff, std) in enumerate(zip(bg_coeffs, bg_std)):
+                for i in range(len(bg_coeffs)):
+                    coeff = bg_coeffs[i]
+                    std_val = bg_std[i] if i < len(bg_std) else float('nan')
+                    fmt_std = _format_weight_std(std_val)
+                    has_bg_std_warning = has_bg_std_warning or _is_std_invalid(std_val)
                     bg_data.append({
                         '阶数': i,
                         '系数': f"{coeff:.6f}",
-                        '标准误差': f"{std:.6f}"
+                        '标准误差': fmt_std
                     })
                 df_bg = pd.DataFrame(bg_data)
                 st.dataframe(df_bg, use_container_width=True, hide_index=True)
+                
+                if has_bg_std_warning or any(_is_std_invalid(pr.weight_std) for pr in result.phase_results):
+                    st.caption("💡 提示：标准误差无法计算或极小时，通常表示：(1) 该参数对拟合质量影响较小；(2) 多个参数存在强共线性（冗余）；(3) 算法未收敛至参数空间的稳定区域。建议检查实验数据质量或调整晶相选择。")
 
 
 def remove_linear_baseline(two_theta: np.ndarray, intensity: np.ndarray) -> np.ndarray:
