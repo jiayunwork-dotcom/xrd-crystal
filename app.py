@@ -88,6 +88,15 @@ def init_session_state():
     
     if 'lebail_result' not in st.session_state:
         st.session_state.lebail_result = None
+    
+    if 'compare_exp_data' not in st.session_state:
+        st.session_state.compare_exp_data = None
+    
+    if 'compare_exp_peaks' not in st.session_state:
+        st.session_state.compare_exp_peaks = None
+    
+    if 'compare_zero_shift' not in st.session_state:
+        st.session_state.compare_zero_shift = 0.0
 
 
 def create_default_crystal() -> Crystal:
@@ -110,7 +119,7 @@ with st.sidebar:
     st.header("📋 导航")
     page = st.radio(
         "选择功能",
-        ["衍射谱模拟", "晶体结构", "指标化", "Le Bail拟合", "多相混合"]
+        ["衍射谱模拟", "晶体结构", "指标化", "Le Bail拟合", "多相混合", "谱图对比"]
     )
     
     st.markdown("---")
@@ -1098,6 +1107,421 @@ def multiphase_section():
         st.plotly_chart(fig, use_container_width=True)
 
 
+def remove_linear_baseline(two_theta: np.ndarray, intensity: np.ndarray) -> np.ndarray:
+    """
+    线性背景扣除: 使用谱图两端点的线性插值作为基线
+    """
+    if len(two_theta) < 2:
+        return intensity
+    
+    x1, y1 = two_theta[0], intensity[0]
+    x2, y2 = two_theta[-1], intensity[-1]
+    
+    if x2 == x1:
+        return intensity - y1
+    
+    slope = (y2 - y1) / (x2 - x1)
+    baseline = y1 + slope * (two_theta - x1)
+    corrected = intensity - baseline
+    corrected = np.maximum(corrected, 0)
+    
+    return corrected
+
+
+def normalize_intensity(intensity: np.ndarray) -> np.ndarray:
+    """
+    归一化: 最高峰设为100
+    """
+    max_val = np.max(intensity)
+    if max_val > 0:
+        return intensity / max_val * 100.0
+    return intensity
+
+
+def load_compare_experimental_data(uploaded_file):
+    """
+    加载并预处理实验谱数据 (用于谱图对比)
+    返回: two_theta, intensity (已做背景扣除和归一化)
+    """
+    try:
+        data = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, comment='#')
+        if data.shape[1] < 2:
+            return None, None, "数据文件需要至少两列: 2theta 和 强度"
+        
+        two_theta = data.iloc[:, 0].values.astype(float)
+        intensity = data.iloc[:, 1].values.astype(float)
+        
+        valid_mask = ~np.isnan(two_theta) & ~np.isnan(intensity)
+        two_theta = two_theta[valid_mask]
+        intensity = intensity[valid_mask]
+        
+        sort_idx = np.argsort(two_theta)
+        two_theta = two_theta[sort_idx]
+        intensity = intensity[sort_idx]
+        
+        intensity_bkg = remove_linear_baseline(two_theta, intensity)
+        intensity_norm = normalize_intensity(intensity_bkg)
+        
+        return two_theta, intensity_norm, None
+    except Exception as e:
+        return None, None, f"数据加载失败: {str(e)}"
+
+
+def compute_rwp(exp_intensity: np.ndarray, calc_intensity: np.ndarray) -> float:
+    """
+    计算Rwp (Weighted Profile R-factor)
+    Rwp = sqrt( sum( w_i * (y_obs_i - y_calc_i)^2 ) / sum( w_i * y_obs_i^2 ) )
+    其中 w_i = 1 / y_obs_i (y_obs_i > 0时)
+    """
+    valid = exp_intensity > 0
+    if not np.any(valid):
+        return 0.0
+    
+    y_obs = exp_intensity[valid]
+    y_calc = calc_intensity[valid]
+    
+    weights = 1.0 / np.maximum(y_obs, 1e-6)
+    
+    numerator = np.sum(weights * (y_obs - y_calc) ** 2)
+    denominator = np.sum(weights * y_obs ** 2)
+    
+    if denominator <= 0:
+        return 0.0
+    
+    return np.sqrt(numerator / denominator)
+
+
+def match_peaks(exp_peaks, theo_peaks, tolerance: float = 0.3):
+    """
+    匹配实验峰和理论峰
+    参数:
+        exp_peaks: 实验峰列表 (Peak对象)
+        theo_peaks: 理论峰列表 (DiffractionPeak对象)
+        tolerance: 容差 (度)
+    返回:
+        matched_exp: 匹配的实验峰列表
+        unmatched_exp: 未匹配的实验峰列表
+        deviations: 匹配峰的2theta偏差列表
+    """
+    matched_exp = []
+    unmatched_exp = []
+    deviations = []
+    
+    used_theo = set()
+    
+    for exp_peak in exp_peaks:
+        best_diff = float('inf')
+        best_theo_idx = -1
+        
+        for i, theo_peak in enumerate(theo_peaks):
+            if i in used_theo:
+                continue
+            diff = abs(exp_peak.two_theta - theo_peak.two_theta)
+            if diff < best_diff:
+                best_diff = diff
+                best_theo_idx = i
+        
+        if best_diff <= tolerance and best_theo_idx >= 0:
+            matched_exp.append(exp_peak)
+            deviations.append(best_diff)
+            used_theo.add(best_theo_idx)
+        else:
+            unmatched_exp.append(exp_peak)
+    
+    return matched_exp, unmatched_exp, deviations
+
+
+def compare_section():
+    """谱图对比部分"""
+    st.header("📊 谱图对比")
+    
+    crystal = st.session_state.crystals.get(st.session_state.current_phase)
+    
+    if crystal is None:
+        st.warning("请先定义晶体结构")
+        return
+    
+    st.subheader(f"当前晶相: {crystal.name}")
+    
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        st.markdown("### 实验数据")
+        uploaded_file = st.file_uploader(
+            "上传实验数据 (CSV/xy)",
+            type=['csv', 'xy', 'txt', 'dat'],
+            help="两列格式: 2theta 强度",
+            key="compare_upload"
+        )
+        
+        if uploaded_file is not None:
+            two_theta, intensity_norm, error = load_compare_experimental_data(uploaded_file)
+            if error is not None:
+                st.error(error)
+            else:
+                st.session_state.compare_exp_data = {
+                    'two_theta': two_theta,
+                    'intensity': intensity_norm
+                }
+                st.session_state.compare_exp_peaks = None
+                st.success(f"成功加载: {len(two_theta)} 个数据点")
+        
+        st.markdown("---")
+        st.markdown("### 寻峰参数")
+        exp_threshold = st.slider("峰高阈值 (%)", 1, 50, 3, 1, key="compare_threshold")
+        exp_min_distance = st.slider("最小峰间距 (°)", 0.1, 2.0, 0.3, 0.1, key="compare_mindist")
+        exp_min_peak_height = st.slider("最小突出度 (%)", 0.5, 20.0, 1.5, 0.5, key="compare_minheight")
+        
+        if st.button("🔎 寻峰", type="primary", key="compare_findpeaks"):
+            if st.session_state.compare_exp_data is None:
+                st.warning("请先上传实验数据")
+            else:
+                with st.spinner("正在寻峰..."):
+                    exp_tt = st.session_state.compare_exp_data['two_theta']
+                    exp_int = st.session_state.compare_exp_data['intensity']
+                    peaks = find_peaks_derivative(
+                        exp_tt,
+                        exp_int,
+                        threshold=exp_threshold / 100.0,
+                        min_distance=exp_min_distance,
+                        min_peak_height=exp_min_peak_height / 100.0,
+                        wavelength=st.session_state.wavelength
+                    )
+                    st.session_state.compare_exp_peaks = peaks
+                    st.success(f"找到 {len(peaks)} 个实验峰")
+        
+        st.markdown("---")
+        st.markdown("### 零点校正")
+        zero_shift = st.slider(
+            "零点偏移 (°)",
+            min_value=-1.0,
+            max_value=1.0,
+            value=st.session_state.compare_zero_shift,
+            step=0.01,
+            format="%.3f",
+            key="compare_zeroshift"
+        )
+        st.session_state.compare_zero_shift = zero_shift
+        st.caption(f"实验谱整体平移: {zero_shift:+.3f}°")
+    
+    with col2:
+        if st.session_state.compare_exp_data is None:
+            st.info("请在左侧上传实验XRD数据")
+            return
+        
+        exp_tt_orig = st.session_state.compare_exp_data['two_theta']
+        exp_int = st.session_state.compare_exp_data['intensity']
+        
+        exp_tt = exp_tt_orig + zero_shift
+        
+        if st.session_state.peaks_data is None:
+            with st.spinner("正在计算理论衍射谱..."):
+                peaks = diffraction_simulation(
+                    crystal,
+                    wavelength=st.session_state.wavelength,
+                    two_theta_min=st.session_state.two_theta_min,
+                    two_theta_max=st.session_state.two_theta_max,
+                    use_symmetry=True
+                )
+                st.session_state.peaks_data = peaks
+        
+        theo_peaks = st.session_state.peaks_data
+        
+        tt_min = max(st.session_state.two_theta_min, np.min(exp_tt))
+        tt_max = min(st.session_state.two_theta_max, np.max(exp_tt))
+        
+        two_theta_range = np.linspace(tt_min, tt_max, 1000)
+        
+        if st.session_state.use_caglioti:
+            theo_pattern = powder_pattern_caglioti(
+                theo_peaks, two_theta_range,
+                U=st.session_state.U,
+                V=st.session_state.V,
+                W=st.session_state.W,
+                eta=st.session_state.eta,
+                wavelength=st.session_state.wavelength
+            )
+        else:
+            theo_pattern = powder_pattern(
+                theo_peaks, two_theta_range,
+                fwhm=st.session_state.fwhm,
+                peak_type="pseudo_voigt",
+                eta=st.session_state.eta
+            )
+        
+        theo_pattern_norm = normalize_intensity(theo_pattern)
+        
+        exp_interp = np.interp(two_theta_range, exp_tt, exp_int, left=0, right=0)
+        difference = exp_interp - theo_pattern_norm
+        
+        exp_peaks = st.session_state.compare_exp_peaks
+        
+        matched_exp = []
+        unmatched_exp = []
+        deviations = []
+        if exp_peaks is not None and len(theo_peaks) > 0:
+            shifted_exp_peaks = []
+            for p in exp_peaks:
+                shifted_exp_peaks.append(Peak(
+                    two_theta=p.two_theta + zero_shift,
+                    intensity=p.intensity,
+                    d_spacing=p.d_spacing
+                ))
+            matched_exp, unmatched_exp, deviations = match_peaks(shifted_exp_peaks, theo_peaks, tolerance=0.3)
+        
+        rwp = compute_rwp(exp_interp, theo_pattern_norm)
+        mean_dev = np.mean(deviations) if deviations else 0.0
+        std_dev = np.std(deviations) if deviations else 0.0
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            row_heights=[0.7, 0.3],
+            shared_xaxes=True,
+            vertical_spacing=0.05
+        )
+        
+        fig.add_trace(go.Scatter(
+            x=exp_tt,
+            y=exp_int,
+            mode='markers',
+            name='实验谱',
+            marker=dict(color='#1f77b4', size=3.5, opacity=0.7),
+            legendgroup='exp'
+        ), row=1, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=two_theta_range,
+            y=theo_pattern_norm,
+            mode='lines',
+            name='理论谱',
+            line=dict(color='#d62728', width=2),
+            legendgroup='theo'
+        ), row=1, col=1)
+        
+        if exp_peaks is not None:
+            shifted_peak_x = [p.two_theta + zero_shift for p in exp_peaks]
+            shifted_peak_y = [p.intensity * 100 if p.intensity <= 1 else p.intensity for p in exp_peaks]
+            fig.add_trace(go.Scatter(
+                x=shifted_peak_x,
+                y=shifted_peak_y,
+                mode='markers',
+                name='实验峰位',
+                marker=dict(
+                    color='#1f77b4',
+                    size=10,
+                    symbol='triangle-down',
+                    line=dict(width=1, color='black')
+                ),
+                legendgroup='exp_peaks'
+            ), row=1, col=1)
+        
+        if len(theo_peaks) > 0:
+            theo_peak_x = [p.two_theta for p in theo_peaks if p.intensity > 0.5]
+            theo_peak_y = [p.intensity for p in theo_peaks if p.intensity > 0.5]
+            fig.add_trace(go.Scatter(
+                x=theo_peak_x,
+                y=theo_peak_y,
+                mode='markers',
+                name='理论峰位',
+                marker=dict(
+                    color='#d62728',
+                    size=10,
+                    symbol='triangle-up',
+                    line=dict(width=1, color='black')
+                ),
+                legendgroup='theo_peaks'
+            ), row=1, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=two_theta_range,
+            y=difference,
+            mode='lines',
+            name='差值 (实验-理论)',
+            line=dict(color='#2ca02c', width=1.2),
+            legendgroup='diff'
+        ), row=2, col=1)
+        
+        fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=2, col=1)
+        
+        fig.update_yaxes(title_text="相对强度 (%)", row=1, col=1)
+        fig.update_yaxes(title_text="差值 (%)", row=2, col=1)
+        fig.update_xaxes(title_text="2θ (°)", row=2, col=1)
+        fig.update_xaxes(range=[tt_min, tt_max])
+        
+        fig.update_layout(
+            title="实验谱与理论谱对比",
+            height=650,
+            legend=dict(orientation='h', y=1.02),
+            hovermode='x unified'
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        
+        stat_col1, stat_col2, stat_col3, stat_col4, stat_col5 = st.columns(5)
+        
+        with stat_col1:
+            st.metric(
+                "匹配峰数",
+                f"{len(matched_exp)}",
+                help="实验峰与最近理论峰2θ差值≤0.3°"
+            )
+        
+        with stat_col2:
+            st.metric(
+                "未匹配实验峰",
+                f"{len(unmatched_exp)}",
+                help="未找到对应理论峰的实验峰数"
+            )
+        
+        with stat_col3:
+            st.metric(
+                "Rwp",
+                f"{rwp*100:.2f}%",
+                help="加权残差因子，越小拟合越好"
+            )
+        
+        with stat_col4:
+            st.metric(
+                "峰位偏差均值",
+                f"{mean_dev:.3f}°",
+                help="匹配峰的2θ偏差绝对值的平均值"
+            )
+        
+        with stat_col5:
+            st.metric(
+                "峰位偏差标准差",
+                f"{std_dev:.3f}°",
+                help="匹配峰的2θ偏差的标准差"
+            )
+        
+        with st.expander("📋 峰匹配详情", expanded=False):
+            if len(matched_exp) > 0:
+                match_data = []
+                for i, ep in enumerate(matched_exp):
+                    nearest_theo = None
+                    min_diff = float('inf')
+                    for tp in theo_peaks:
+                        diff = abs(ep.two_theta - tp.two_theta)
+                        if diff < min_diff:
+                            min_diff = diff
+                            nearest_theo = tp
+                    
+                    match_data.append({
+                        '序号': i + 1,
+                        '实验峰 2θ (°)': round(ep.two_theta, 4),
+                        '理论峰 2θ (°)': round(nearest_theo.two_theta, 4) if nearest_theo else '-',
+                        '偏差 (°)': round(min_diff, 4),
+                        '理论 hkl': f"({nearest_theo.h}{nearest_theo.k}{nearest_theo.l})" if nearest_theo else '-',
+                        '实验强度 (%)': round(ep.intensity * 100 if ep.intensity <= 1 else ep.intensity, 2),
+                    })
+                df_match = pd.DataFrame(match_data)
+                st.dataframe(df_match, use_container_width=True, height=300)
+            else:
+                st.info("暂无匹配峰数据，请先上传实验数据并寻峰")
+
+
 if page == "衍射谱模拟":
     crystal_input_section()
     st.markdown("---")
@@ -1116,6 +1540,9 @@ elif page == "Le Bail拟合":
 
 elif page == "多相混合":
     multiphase_section()
+
+elif page == "谱图对比":
+    compare_section()
 
 
 with st.sidebar:
