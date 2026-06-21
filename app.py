@@ -20,6 +20,7 @@ from xrd_crystal.peak_fitting import pseudo_voigt, caglioti_fwhm
 from xrd_crystal.indexing import find_peaks_derivative, index_pattern, Peak, d_from_twotheta, twotheta_from_d
 from xrd_crystal.le_bail import le_bail_fit
 from xrd_crystal.visualization import plot_crystal_3d, get_atom_color
+from xrd_crystal.quantitative_analysis import quantitative_analysis, QuantitativeResult, PhaseQuantResult
 
 
 st.set_page_config(
@@ -97,6 +98,24 @@ def init_session_state():
     
     if 'compare_zero_shift' not in st.session_state:
         st.session_state.compare_zero_shift = 0.0
+    
+    if 'quant_selected_phases' not in st.session_state:
+        st.session_state.quant_selected_phases = []
+    
+    if 'quant_exp_data' not in st.session_state:
+        st.session_state.quant_exp_data = None
+    
+    if 'quant_result' not in st.session_state:
+        st.session_state.quant_result = None
+    
+    if 'quant_bg_order' not in st.session_state:
+        st.session_state.quant_bg_order = 3
+    
+    if 'quant_max_iter' not in st.session_state:
+        st.session_state.quant_max_iter = 200
+    
+    if 'quant_tolerance' not in st.session_state:
+        st.session_state.quant_tolerance = 1e-6
 
 
 def create_default_crystal() -> Crystal:
@@ -119,7 +138,7 @@ with st.sidebar:
     st.header("📋 导航")
     page = st.radio(
         "选择功能",
-        ["衍射谱模拟", "晶体结构", "指标化", "Le Bail拟合", "多相混合", "谱图对比"]
+        ["衍射谱模拟", "晶体结构", "指标化", "Le Bail拟合", "多相混合", "定量分析", "谱图对比"]
     )
     
     st.markdown("---")
@@ -1111,6 +1130,394 @@ def multiphase_section():
         st.plotly_chart(fig, use_container_width=True)
 
 
+def quantitative_analysis_section():
+    """定量分析部分"""
+    st.header("🔬 多相定量分析")
+    
+    col_left, col_right = st.columns([1, 2])
+    
+    with col_left:
+        st.markdown("### 📂 实验数据")
+        uploaded_file = st.file_uploader(
+            "上传实验XRD数据",
+            type=['csv', 'xy', 'txt', 'dat'],
+            help="两列格式: 2theta 强度",
+            key="quant_upload"
+        )
+        
+        if uploaded_file is not None:
+            try:
+                data = pd.read_csv(uploaded_file, sep='\\s+', engine='python', header=None, comment='#')
+                if data.shape[1] < 2:
+                    st.error("数据文件需要至少两列: 2theta 和 强度")
+                else:
+                    two_theta = data.iloc[:, 0].values.astype(float)
+                    intensity = data.iloc[:, 1].values.astype(float)
+                    
+                    valid_mask = ~np.isnan(two_theta) & ~np.isnan(intensity)
+                    two_theta = two_theta[valid_mask]
+                    intensity = intensity[valid_mask]
+                    
+                    if len(two_theta) > 0:
+                        sort_idx = np.argsort(two_theta)
+                        two_theta = two_theta[sort_idx]
+                        intensity = intensity[sort_idx]
+                        
+                        st.session_state.quant_exp_data = {
+                            'two_theta': two_theta,
+                            'intensity': intensity
+                        }
+                        st.session_state.quant_result = None
+                        st.success(f"成功加载数据: {len(two_theta)} 个数据点")
+                    else:
+                        st.error("有效数据点为0")
+            except Exception as e:
+                st.error(f"数据加载失败: {e}")
+        
+        if st.session_state.quant_exp_data is not None:
+            exp_tt = st.session_state.quant_exp_data['two_theta']
+            exp_int = st.session_state.quant_exp_data['intensity']
+            exp_int_norm = exp_int / np.max(exp_int) * 100 if np.max(exp_int) > 0 else exp_int
+            
+            with st.expander("📈 查看实验谱预览", expanded=False):
+                fig_preview = go.Figure()
+                fig_preview.add_trace(go.Scatter(
+                    x=exp_tt, y=exp_int_norm,
+                    mode='markers', name='实验谱',
+                    marker=dict(color='black', size=3)
+                ))
+                fig_preview.update_layout(
+                    title="实验XRD谱",
+                    xaxis_title="2θ (°)",
+                    yaxis_title="相对强度 (%)",
+                    height=250
+                )
+                st.plotly_chart(fig_preview, use_container_width=True)
+        
+        st.markdown("---")
+        st.markdown("### 💎 晶相选择")
+        st.caption("选择2-4个已知晶相进行定量分析")
+        
+        available_phases = list(st.session_state.crystals.keys())
+        if len(available_phases) == 0:
+            st.warning("暂无晶体相，请先在其他页面定义晶相")
+        else:
+            for phase_name in available_phases:
+                crystal = st.session_state.crystals[phase_name]
+                is_selected = phase_name in st.session_state.quant_selected_phases
+                checked = st.checkbox(
+                    f"{phase_name}: {crystal.name} ({crystal.space_group})",
+                    value=is_selected,
+                    key=f"quant_cb_{phase_name}"
+                )
+                if checked and phase_name not in st.session_state.quant_selected_phases:
+                    if len(st.session_state.quant_selected_phases) < 4:
+                        st.session_state.quant_selected_phases.append(phase_name)
+                    else:
+                        st.warning("最多只能选择4个晶相")
+                elif not checked and phase_name in st.session_state.quant_selected_phases:
+                    st.session_state.quant_selected_phases.remove(phase_name)
+        
+        n_selected = len(st.session_state.quant_selected_phases)
+        st.info(f"已选择 {n_selected} 个晶相 (需2-4个)")
+        
+        st.markdown("---")
+        st.markdown("### ⚙️ 拟合参数")
+        
+        bg_order = st.slider(
+            "多项式背景阶数",
+            min_value=2, max_value=5,
+            value=st.session_state.quant_bg_order,
+            step=1,
+            key="quant_bg_order_slider"
+        )
+        st.session_state.quant_bg_order = bg_order
+        
+        max_iter = st.slider(
+            "最大迭代次数",
+            min_value=50, max_value=1000,
+            value=st.session_state.quant_max_iter,
+            step=50,
+            key="quant_max_iter_slider"
+        )
+        st.session_state.quant_max_iter = max_iter
+        
+        tol_options = [1e-4, 1e-5, 1e-6, 1e-7, 1e-8]
+        tol_labels = ["1e-4", "1e-5", "1e-6", "1e-7", "1e-8"]
+        tol_idx = tol_options.index(st.session_state.quant_tolerance) if st.session_state.quant_tolerance in tol_options else 2
+        tolerance = float(st.selectbox(
+            "收敛阈值",
+            options=tol_options,
+            format_func=lambda x: tol_labels[tol_options.index(x)],
+            index=tol_idx,
+            key="quant_tolerance_sb"
+        ))
+        st.session_state.quant_tolerance = tolerance
+        
+        can_run = (st.session_state.quant_exp_data is not None 
+                   and 2 <= n_selected <= 4)
+        
+        if st.button("🧮 开始定量分析", type="primary", disabled=not can_run):
+            if not can_run:
+                if st.session_state.quant_exp_data is None:
+                    st.warning("请先上传实验XRD数据")
+                else:
+                    st.warning("请选择2-4个晶相")
+            else:
+                selected_crystals = {}
+                for phase_name in st.session_state.quant_selected_phases:
+                    selected_crystals[phase_name] = st.session_state.crystals[phase_name]
+                
+                progress_bar = st.progress(0, text="正在准备计算...")
+                
+                try:
+                    exp_data = st.session_state.quant_exp_data
+                    two_theta = exp_data['two_theta']
+                    intensity = exp_data['intensity']
+                    
+                    progress_bar.progress(20, text="正在计算各相理论谱...")
+                    
+                    result = quantitative_analysis(
+                        two_theta=two_theta,
+                        intensity=intensity,
+                        selected_crystals=selected_crystals,
+                        wavelength=st.session_state.wavelength,
+                        use_caglioti=st.session_state.use_caglioti,
+                        U=st.session_state.U,
+                        V=st.session_state.V,
+                        W=st.session_state.W,
+                        fwhm=st.session_state.fwhm,
+                        eta=st.session_state.eta,
+                        background_order=bg_order,
+                        max_iterations=max_iter,
+                        tolerance=tolerance
+                    )
+                    
+                    progress_bar.progress(100, text="计算完成!")
+                    st.session_state.quant_result = result
+                    
+                except Exception as e:
+                    st.error(f"定量分析失败: {e}")
+                    import traceback
+                    st.error(traceback.format_exc())
+                finally:
+                    progress_bar.empty()
+    
+    with col_right:
+        if st.session_state.quant_result is None:
+            st.info("请在左侧上传实验数据、选择晶相并点击\"开始定量分析\"")
+            st.markdown("""
+            ### 使用说明
+            1. **上传实验数据**: 导入两列格式(2θ, 强度)的XRD谱数据文件
+            2. **选择晶相**: 从已有晶体库中选择2-4个已知晶相
+            3. **设置参数**: 调整背景阶数、迭代次数和收敛阈值
+            4. **开始计算**: 点击按钮执行加权最小二乘拟合
+            
+            ### 算法说明
+            - 对每个候选相计算理论衍射谱(含峰形展宽)
+            - 各相理论谱按权重线性叠加 + 多项式背景
+            - 优化目标: 加权残差平方和(权重取1/y_obs)
+            - 约束: 各相权重非负; 含量<1%自动剔除
+            - 最终结果归一化到质量百分比
+            """)
+        else:
+            result = st.session_state.quant_result
+            
+            st.subheader("📊 定量结果")
+            
+            result_data = []
+            for pr in result.phase_results:
+                result_data.append({
+                    '相名称': pr.phase_name,
+                    '晶体名称': pr.crystal_name,
+                    '空间群': f"{pr.space_group} (#{pr.space_group_number})",
+                    '权重因子': f"{pr.weight:.4f} ± {pr.weight_std:.4f}",
+                    '质量百分比 (%)': f"{pr.mass_percent:.2f}",
+                    'Rwp贡献度': f"{pr.rwp_contribution*100:.3f}%"
+                })
+            
+            df_result = pd.DataFrame(result_data)
+            st.dataframe(df_result, use_container_width=True, hide_index=True)
+            
+            csv_buffer = io.StringIO()
+            df_result.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+            csv_data = csv_buffer.getvalue()
+            
+            st.download_button(
+                "📥 导出定量结果 (CSV)",
+                csv_data,
+                "quantitative_result.csv",
+                "text/csv",
+                key='download-quant-csv'
+            )
+            
+            if result.removed_phases:
+                st.warning(f"以下晶相因含量过低(<1%)已自动剔除: {', '.join(result.removed_phases)}")
+            
+            st.markdown("---")
+            
+            st.subheader("📈 拟合谱图")
+            
+            phase_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd']
+            
+            fig = make_subplots(
+                rows=2, cols=1,
+                row_heights=[0.75, 0.25],
+                shared_xaxes=True,
+                vertical_spacing=0.05
+            )
+            
+            fig.add_trace(go.Scatter(
+                x=result.two_theta,
+                y=result.observed_intensity,
+                mode='markers',
+                name='实验谱',
+                marker=dict(color='black', size=3.5, opacity=0.7),
+                legendgroup='exp'
+            ), row=1, col=1)
+            
+            fig.add_trace(go.Scatter(
+                x=result.two_theta,
+                y=result.calculated_pattern,
+                mode='lines',
+                name='总计算谱',
+                line=dict(color='red', width=2),
+                legendgroup='calc_total'
+            ), row=1, col=1)
+            
+            for i, pr in enumerate(result.phase_results):
+                color = phase_colors[i % len(phase_colors)]
+                phase_pat = result.phase_patterns.get(pr.phase_name, np.zeros_like(result.two_theta))
+                fig.add_trace(go.Scatter(
+                    x=result.two_theta,
+                    y=phase_pat,
+                    mode='lines',
+                    name=f"{pr.phase_name}分谱",
+                    line=dict(color=color, width=1.5, dash='dash'),
+                    opacity=0.7,
+                    legendgroup=f'phase_{i}'
+                ), row=1, col=1)
+            
+            fig.add_trace(go.Scatter(
+                x=result.two_theta,
+                y=result.background_pattern,
+                mode='lines',
+                name='背景',
+                line=dict(color='gray', width=1.5),
+                opacity=0.6,
+                legendgroup='bg'
+            ), row=1, col=1)
+            
+            for i, pr in enumerate(result.phase_results):
+                crystal = st.session_state.crystals.get(pr.phase_name)
+                if crystal is not None:
+                    try:
+                        peaks = diffraction_simulation(
+                            crystal,
+                            wavelength=st.session_state.wavelength,
+                            two_theta_min=float(np.min(result.two_theta)),
+                            two_theta_max=float(np.max(result.two_theta)),
+                            use_symmetry=True
+                        )
+                        if peaks:
+                            max_peak = max(peaks, key=lambda p: p.intensity)
+                            y_max = np.max(result.calculated_pattern)
+                            color = phase_colors[i % len(phase_colors)]
+                            for peak in peaks[:5]:
+                                if peak.intensity > max_peak.intensity * 0.1:
+                                    fig.add_annotation(
+                                        x=peak.two_theta,
+                                        y=y_max * 0.95,
+                                        text=f"({peak.h}{peak.k}{peak.l})",
+                                        showarrow=False,
+                                        font=dict(size=8, color=color),
+                                        textangle=-90,
+                                        xanchor='center',
+                                        yanchor='top',
+                                        row=1, col=1
+                                    )
+                    except Exception:
+                        pass
+            
+            fig.add_trace(go.Scatter(
+                x=result.two_theta,
+                y=result.difference_pattern,
+                mode='lines',
+                name='差值 (实验-计算)',
+                line=dict(color='#2ca02c', width=1.2),
+                legendgroup='diff'
+            ), row=2, col=1)
+            
+            fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5, row=2, col=1)
+            
+            fig.update_yaxes(title_text="相对强度 (%)", row=1, col=1)
+            fig.update_yaxes(title_text="差值", row=2, col=1)
+            fig.update_xaxes(title_text="2θ (°)", row=2, col=1)
+            
+            fig.update_layout(
+                title=f"定量分析拟合结果 - Rwp = {result.Rwp*100:.2f}%",
+                height=650,
+                legend=dict(orientation='h', y=1.02),
+                hovermode='x unified'
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.markdown("---")
+            
+            st.subheader("📋 收敛信息")
+            
+            col_stat1, col_stat2, col_stat3, col_stat4 = st.columns(4)
+            
+            with col_stat1:
+                st.metric(
+                    "迭代次数",
+                    f"{result.iterations}",
+                    help="实际执行的迭代次数"
+                )
+            
+            with col_stat2:
+                st.metric(
+                    "收敛状态",
+                    "✓ 已收敛" if result.converged else "⚠ 未收敛",
+                    help="优化算法是否达到收敛条件"
+                )
+            
+            with col_stat3:
+                st.metric(
+                    "最终 Rwp",
+                    f"{result.Rwp*100:.3f}%",
+                    help="加权残差因子，越小拟合越好"
+                )
+            
+            with col_stat4:
+                st.metric(
+                    "χ² (卡方)",
+                    f"{result.chi_squared:.4f}",
+                    help="自由度校正后的卡方值"
+                )
+            
+            with st.expander("📊 参数标准误差详情", expanded=False):
+                n_phases = len(result.phase_results)
+                bg_coeffs = result.background_coeffs
+                bg_std = result.param_std_errors[n_phases:]
+                
+                st.markdown("**各相权重标准误差:**")
+                for i, pr in enumerate(result.phase_results):
+                    st.write(f"- {pr.phase_name}: σ = {pr.weight_std:.6f}")
+                
+                st.markdown("**背景多项式系数 (c₀ + c₁x + c₂x² + ...):**")
+                bg_data = []
+                for i, (coeff, std) in enumerate(zip(bg_coeffs, bg_std)):
+                    bg_data.append({
+                        '阶数': i,
+                        '系数': f"{coeff:.6f}",
+                        '标准误差': f"{std:.6f}"
+                    })
+                df_bg = pd.DataFrame(bg_data)
+                st.dataframe(df_bg, use_container_width=True, hide_index=True)
+
+
 def remove_linear_baseline(two_theta: np.ndarray, intensity: np.ndarray) -> np.ndarray:
     """
     线性背景扣除: 使用谱图两端点的线性插值作为基线
@@ -1547,6 +1954,9 @@ elif page == "Le Bail拟合":
 
 elif page == "多相混合":
     multiphase_section()
+
+elif page == "定量分析":
+    quantitative_analysis_section()
 
 elif page == "谱图对比":
     compare_section()
