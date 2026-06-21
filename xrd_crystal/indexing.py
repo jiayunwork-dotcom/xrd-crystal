@@ -14,6 +14,7 @@ class Peak:
     two_theta: float
     intensity: float
     d_spacing: float
+    fwhm: float = 0.0
 
 
 @dataclass
@@ -30,6 +31,54 @@ class IndexingResult:
     F30: float
     n_peaks_indexed: int
     volume: float
+
+
+def estimate_fwhm(two_theta: np.ndarray, 
+                  intensity: np.ndarray, 
+                  peak_idx: int) -> float:
+    """
+    估算峰的半高宽(FWHM)
+    
+    参数:
+        two_theta: 2theta数组
+        intensity: 强度数组
+        peak_idx: 峰顶点的索引
+    
+    返回:
+        FWHM值 (度)，如果无法估算则返回0.0
+    """
+    n = len(two_theta)
+    if peak_idx <= 0 or peak_idx >= n - 1:
+        return 0.0
+    
+    peak_height = intensity[peak_idx]
+    half_height = peak_height / 2.0
+    
+    left_idx = peak_idx
+    while left_idx > 0 and intensity[left_idx] > half_height:
+        left_idx -= 1
+    
+    right_idx = peak_idx
+    while right_idx < n - 1 and intensity[right_idx] > half_height:
+        right_idx += 1
+    
+    if left_idx >= right_idx:
+        return 0.0
+    
+    if intensity[left_idx] == intensity[left_idx + 1]:
+        left_tt = two_theta[left_idx]
+    else:
+        frac_left = (half_height - intensity[left_idx]) / (intensity[left_idx + 1] - intensity[left_idx])
+        left_tt = two_theta[left_idx] + frac_left * (two_theta[left_idx + 1] - two_theta[left_idx])
+    
+    if intensity[right_idx] == intensity[right_idx - 1]:
+        right_tt = two_theta[right_idx]
+    else:
+        frac_right = (half_height - intensity[right_idx - 1]) / (intensity[right_idx] - intensity[right_idx - 1])
+        right_tt = two_theta[right_idx - 1] + frac_right * (two_theta[right_idx] - two_theta[right_idx - 1])
+    
+    fwhm = right_tt - left_tt
+    return max(fwhm, 0.0)
 
 
 def find_peaks_derivative(two_theta: np.ndarray, 
@@ -100,10 +149,12 @@ def find_peaks_derivative(two_theta: np.ndarray,
             if intensity_smooth[idx] >= threshold * np.max(intensity_smooth):
                 used_indices.add(idx)
                 d = wavelength / (2 * np.sin(np.deg2rad(two_theta[idx] / 2)))
+                fwhm = estimate_fwhm(two_theta, intensity_smooth, idx)
                 peaks.append(Peak(
                     two_theta=two_theta[idx],
                     intensity=intensity_smooth[idx],
-                    d_spacing=d
+                    d_spacing=d,
+                    fwhm=fwhm
                 ))
     
     peaks.sort(key=lambda p: p.two_theta)
@@ -144,10 +195,12 @@ def find_peaks_scipy(two_theta: np.ndarray,
     peaks = []
     for idx in peak_indices:
         d = wavelength / (2 * np.sin(np.deg2rad(two_theta[idx] / 2)))
+        fwhm = estimate_fwhm(two_theta, intensity_norm, idx)
         peaks.append(Peak(
             two_theta=two_theta[idx],
             intensity=intensity_norm[idx],
-            d_spacing=d
+            d_spacing=d,
+            fwhm=fwhm
         ))
     
     return peaks

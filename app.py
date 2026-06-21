@@ -8,6 +8,8 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import io
+from dataclasses import dataclass
+from typing import List
 
 import sys
 sys.path.insert(0, '.')
@@ -117,6 +119,24 @@ def init_session_state():
     
     if 'quant_tolerance' not in st.session_state:
         st.session_state.quant_tolerance = 1e-6
+    
+    if 'wh_use_caglioti' not in st.session_state:
+        st.session_state.wh_use_caglioti = False
+    
+    if 'wh_fwhm' not in st.session_state:
+        st.session_state.wh_fwhm = 0.1
+    
+    if 'wh_U' not in st.session_state:
+        st.session_state.wh_U = 0.02
+    
+    if 'wh_V' not in st.session_state:
+        st.session_state.wh_V = -0.01
+    
+    if 'wh_W' not in st.session_state:
+        st.session_state.wh_W = 0.015
+    
+    if 'wh_result' not in st.session_state:
+        st.session_state.wh_result = None
 
 
 def create_default_crystal() -> Crystal:
@@ -139,7 +159,7 @@ with st.sidebar:
     st.header("📋 导航")
     page = st.radio(
         "选择功能",
-        ["衍射谱模拟", "晶体结构", "指标化", "Le Bail拟合", "多相混合", "定量分析", "谱图对比"]
+        ["衍射谱模拟", "晶体结构", "指标化", "W-H分析", "Le Bail拟合", "多相混合", "定量分析", "谱图对比"]
     )
     
     st.markdown("---")
@@ -770,7 +790,8 @@ def indexing_section():
                         '序号': i + 1,
                         '2θ (°)': round(peak.two_theta, 4),
                         'd (Å)': round(peak.d_spacing, 4),
-                        '相对强度 (%)': round(peak.intensity * 100, 2)
+                        '相对强度 (%)': round(peak.intensity * 100, 2),
+                        'FWHM (°)': round(peak.fwhm, 4) if peak.fwhm > 0 else '-'
                     })
                 df = pd.DataFrame(peak_data)
                 st.dataframe(df, use_container_width=True, height=300)
@@ -853,6 +874,545 @@ def indexing_section():
                             st.info("可在'衍射谱模拟'或'Le Bail拟合'中继续分析")
             else:
                 st.warning(f"检出峰数不足 (当前 {len(peaks)} 个)，至少需要8个峰才能进行指标化。请调整寻峰参数。")
+
+
+@dataclass
+class WHPeakData:
+    """W-H分析中单个峰的数据"""
+    two_theta: float
+    d_spacing: float
+    fwhm_measured: float
+    fwhm_instrument: float
+    beta_sample: float
+    intensity: float
+    x_value: float
+    y_value: float
+    excluded: bool
+    exclude_reason: str
+
+
+@dataclass
+class WHResult:
+    """Williamson-Hall分析结果"""
+    peaks_data: list
+    valid_count: int
+    total_count: int
+    slope: float
+    intercept: float
+    r_squared: float
+    crystallite_size: float
+    microstrain: float
+    valid_peaks_x: list
+    valid_peaks_y: list
+    valid_peaks_intensity: list
+    fit_line_x: list
+    fit_line_y: list
+
+
+def williamson_hall_analysis(
+    peaks: list,
+    wavelength: float,
+    use_caglioti: bool,
+    fwhm_fixed: float,
+    U: float, V: float, W: float,
+    K: float = 0.9
+) -> WHResult:
+    """
+    Williamson-Hall分析核心计算
+    
+    参数:
+        peaks: Peak对象列表
+        wavelength: X射线波长 (Å)
+        use_caglioti: 是否使用Caglioti公式计算仪器展宽
+        fwhm_fixed: 固定仪器FWHM值 (°)
+        U, V, W: Caglioti公式参数
+        K: Scherrer公式形状因子 (默认0.9)
+    
+    返回:
+        WHResult对象
+    """
+    peaks_data = []
+    valid_x = []
+    valid_y = []
+    valid_weights = []
+    
+    for peak in peaks:
+        two_theta = peak.two_theta
+        intensity = peak.intensity
+        fwhm_measured = peak.fwhm
+        
+        if fwhm_measured <= 0:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=0.0,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="FWHM未能估算"
+            ))
+            continue
+        
+        if use_caglioti:
+            fwhm_instrument = caglioti_fwhm(two_theta, U, V, W, wavelength)
+        else:
+            fwhm_instrument = fwhm_fixed
+        
+        beta_sq = fwhm_measured**2 - fwhm_instrument**2
+        
+        if beta_sq <= 0:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=fwhm_instrument,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="实测FWHM≤仪器展宽"
+            ))
+            continue
+        
+        beta_sample = np.sqrt(beta_sq)
+        beta_sample_rad = np.deg2rad(beta_sample)
+        
+        theta_rad = np.deg2rad(two_theta / 2.0)
+        x_val = 4.0 * np.sin(theta_rad)
+        y_val = beta_sample_rad * np.cos(theta_rad)
+        
+        peaks_data.append(WHPeakData(
+            two_theta=two_theta,
+            d_spacing=peak.d_spacing,
+            fwhm_measured=fwhm_measured,
+            fwhm_instrument=fwhm_instrument,
+            beta_sample=beta_sample,
+            intensity=intensity,
+            x_value=x_val,
+            y_value=y_val,
+            excluded=False,
+            exclude_reason=""
+        ))
+        
+        valid_x.append(x_val)
+        valid_y.append(y_val)
+        valid_weights.append(intensity)
+    
+    total_count = len(peaks_data)
+    valid_count = len(valid_x)
+    
+    if valid_count < 3:
+        return WHResult(
+            peaks_data=peaks_data,
+            valid_count=valid_count,
+            total_count=total_count,
+            slope=0.0,
+            intercept=0.0,
+            r_squared=0.0,
+            crystallite_size=0.0,
+            microstrain=0.0,
+            valid_peaks_x=[],
+            valid_peaks_y=[],
+            valid_peaks_intensity=[],
+            fit_line_x=[],
+            fit_line_y=[]
+        )
+    
+    valid_x_arr = np.array(valid_x)
+    valid_y_arr = np.array(valid_y)
+    weights_arr = np.array(valid_weights)
+    weights_norm = weights_arr / np.sum(weights_arr)
+    
+    def weighted_linear_regression(x, y, w):
+        """加权线性回归"""
+        sum_w = np.sum(w)
+        sum_wx = np.sum(w * x)
+        sum_wy = np.sum(w * y)
+        sum_wxx = np.sum(w * x * x)
+        sum_wxy = np.sum(w * x * y)
+        
+        denominator = sum_w * sum_wxx - sum_wx**2
+        
+        if abs(denominator) < 1e-15:
+            return 0.0, np.mean(y), 0.0
+        
+        slope = (sum_w * sum_wxy - sum_wx * sum_wy) / denominator
+        intercept = (sum_wy - slope * sum_wx) / sum_w
+        
+        y_pred = slope * x + intercept
+        ss_tot = np.sum(w * (y - np.sum(w * y) / sum_w)**2)
+        ss_res = np.sum(w * (y - y_pred)**2)
+        
+        if ss_tot < 1e-15:
+            r_squared = 1.0 if ss_res < 1e-15 else 0.0
+        else:
+            r_squared = 1.0 - ss_res / ss_tot
+        
+        return slope, intercept, r_squared
+    
+    slope, intercept, r_squared = weighted_linear_regression(
+        valid_x_arr, valid_y_arr, weights_norm
+    )
+    
+    wavelength_nm = wavelength * 0.1
+    if abs(intercept) > 1e-15:
+        crystallite_size_nm = K * wavelength_nm / intercept
+    else:
+        crystallite_size_nm = 0.0
+    
+    microstrain = slope if valid_count > 0 else 0.0
+    
+    x_min, x_max = np.min(valid_x_arr), np.max(valid_x_arr)
+    x_pad = (x_max - x_min) * 0.1 if x_max > x_min else 0.01
+    fit_line_x = np.linspace(x_min - x_pad, x_max + x_pad, 100)
+    fit_line_y = slope * fit_line_x + intercept
+    
+    return WHResult(
+        peaks_data=peaks_data,
+        valid_count=valid_count,
+        total_count=total_count,
+        slope=slope,
+        intercept=intercept,
+        r_squared=r_squared,
+        crystallite_size=crystallite_size_nm,
+        microstrain=microstrain,
+        valid_peaks_x=valid_x,
+        valid_peaks_y=valid_y,
+        valid_peaks_intensity=[p.intensity for p in peaks_data if not p.excluded],
+        fit_line_x=fit_line_x.tolist(),
+        fit_line_y=fit_line_y.tolist()
+    )
+
+
+def create_wh_plot(wh_result: WHResult) -> go.Figure:
+    """创建Williamson-Hall图"""
+    fig = go.Figure()
+    
+    excluded_x = [p.x_value for p in wh_result.peaks_data if p.excluded and p.fwhm_measured > 0]
+    excluded_y = [p.y_value for p in wh_result.peaks_data if p.excluded and p.fwhm_measured > 0]
+    
+    if excluded_x:
+        fig.add_trace(go.Scatter(
+            x=excluded_x,
+            y=excluded_y,
+            mode='markers',
+            name='已排除峰',
+            marker=dict(
+                color='gray',
+                size=8,
+                symbol='x',
+                opacity=0.6
+            ),
+            hovertext=[
+                f"2θ={p.two_theta:.3f}°<br>排除原因: {p.exclude_reason}"
+                for p in wh_result.peaks_data if p.excluded and p.fwhm_measured > 0
+            ],
+            hoverinfo='text'
+        ))
+    
+    if wh_result.valid_peaks_x:
+        marker_sizes = 8 + 8 * np.array(wh_result.valid_peaks_intensity)
+        marker_sizes = np.clip(marker_sizes, 8, 20)
+        
+        fig.add_trace(go.Scatter(
+            x=wh_result.valid_peaks_x,
+            y=wh_result.valid_peaks_y,
+            mode='markers',
+            name='有效峰',
+            marker=dict(
+                color='#1f77b4',
+                size=marker_sizes.tolist(),
+                symbol='circle',
+                line=dict(width=1, color='black')
+            ),
+            hovertext=[
+                f"2θ={p.two_theta:.3f}°<br>d={p.d_spacing:.4f} Å<br>"
+                f"强度={p.intensity*100:.1f}%<br>β={p.beta_sample:.4f}°"
+                for p in wh_result.peaks_data if not p.excluded
+            ],
+            hoverinfo='text'
+        ))
+    
+    if wh_result.fit_line_x:
+        fig.add_trace(go.Scatter(
+            x=wh_result.fit_line_x,
+            y=wh_result.fit_line_y,
+            mode='lines',
+            name='拟合直线',
+            line=dict(color='#d62728', width=2, dash='solid')
+        ))
+    
+    annotation_text = (
+        f"斜率 = {wh_result.slope:.6f} (ε = {wh_result.microstrain:.4f})<br>"
+        f"截距 = {wh_result.intercept:.6f} (D = {wh_result.crystallite_size:.2f} nm)<br>"
+        f"R² = {wh_result.r_squared:.4f}"
+    )
+    
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.02, y=0.98,
+        text=annotation_text,
+        showarrow=False,
+        font=dict(size=12),
+        align="left",
+        bgcolor="rgba(255,255,255,0.9)",
+        bordercolor="black",
+        borderwidth=1,
+        borderpad=8
+    )
+    
+    fig.update_layout(
+        title="Williamson-Hall分析图",
+        xaxis_title="4·sin(θ)",
+        yaxis_title="β·cos(θ) (rad)",
+        height=500,
+        legend=dict(orientation='h', y=1.02),
+        hovermode='closest'
+    )
+    
+    return fig
+
+
+def wh_section():
+    """Williamson-Hall分析页面"""
+    st.header("📐 Williamson-Hall分析")
+    
+    st.markdown("""
+    **原理说明**: Williamson-Hall方法通过分析各衍射峰的展宽，分离晶粒尺寸细化和微应变两个贡献。
+    - **晶粒尺寸效应**: Scherrer公式描述，与 `1/cos(θ)` 成正比
+    - **微应变效应**: 与 `tan(θ)` 成正比
+    - **综合公式**: `β·cos(θ) = K·λ/D + 4·ε·sin(θ)`
+    """)
+    
+    if st.session_state.exp_peaks is None or len(st.session_state.exp_peaks) == 0:
+        st.warning("⚠️ 请先在【指标化】页面上传实验数据并完成寻峰后，再进行W-H分析。")
+        return
+    
+    peaks = st.session_state.exp_peaks
+    has_valid_fwhm = any(p.fwhm > 0 for p in peaks)
+    if not has_valid_fwhm:
+        st.warning("⚠️ 当前寻峰结果中没有可用的FWHM数据。请重新执行寻峰，确保数据点密度足够（峰宽至少覆盖多个数据点）。")
+        return
+    
+    st.info(f"📊 已从【指标化】页面读取到 {len(peaks)} 个峰的数据。")
+    
+    st.markdown("---")
+    st.subheader("⚙️ 仪器展宽参数")
+    
+    wh_use_caglioti = st.radio(
+        "仪器展宽计算方式",
+        ["固定FWHM值", "Caglioti公式 (U/V/W)"],
+        index=0 if not st.session_state.wh_use_caglioti else 1,
+        horizontal=True
+    )
+    st.session_state.wh_use_caglioti = (wh_use_caglioti == "Caglioti公式 (U/V/W)")
+    
+    if st.session_state.wh_use_caglioti:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            wh_U = st.number_input(
+                "U",
+                value=st.session_state.wh_U,
+                step=0.001,
+                format="%.4f",
+                key="wh_U_input"
+            )
+        with col2:
+            wh_V = st.number_input(
+                "V",
+                value=st.session_state.wh_V,
+                step=0.001,
+                format="%.4f",
+                key="wh_V_input"
+            )
+        with col3:
+            wh_W = st.number_input(
+                "W",
+                value=st.session_state.wh_W,
+                step=0.001,
+                format="%.4f",
+                key="wh_W_input"
+            )
+        st.session_state.wh_U = wh_U
+        st.session_state.wh_V = wh_V
+        st.session_state.wh_W = wh_W
+        wh_fwhm_val = 0.0
+    else:
+        wh_fwhm_val = st.number_input(
+            "仪器展宽 FWHM (°)",
+            value=st.session_state.wh_fwhm,
+            min_value=0.001,
+            max_value=5.0,
+            step=0.01,
+            format="%.4f",
+            help="仪器本身的固有展宽，需要根据标准样品(如LaB6、Si)实验测定"
+        )
+        st.session_state.wh_fwhm = wh_fwhm_val
+        wh_U, wh_V, wh_W = 0.0, 0.0, 0.0
+    
+    st.caption(
+        "校正公式 (高斯型假设): β_sample = √(FWHM²_measured - FWHM²_instrument)"
+    )
+    
+    col_calc1, _ = st.columns([1, 4])
+    with col_calc1:
+        recalc_btn = st.button("🔄 重新计算", type="primary", use_container_width=True)
+    
+    if recalc_btn or st.session_state.wh_result is None:
+        with st.spinner("正在执行Williamson-Hall分析..."):
+            wh_result = williamson_hall_analysis(
+                peaks=peaks,
+                wavelength=st.session_state.wavelength,
+                use_caglioti=st.session_state.wh_use_caglioti,
+                fwhm_fixed=wh_fwhm_val,
+                U=wh_U, V=wh_V, W=wh_W,
+                K=0.9
+            )
+            st.session_state.wh_result = wh_result
+    else:
+        wh_result = st.session_state.wh_result
+    
+    st.markdown("---")
+    
+    if wh_result.valid_count < 3:
+        st.error(f"❌ 有效峰数不足（当前 {wh_result.valid_count}/共 {wh_result.total_count}，至少需要3个）。"
+                 f"无法进行W-H分析。请尝试：")
+        st.markdown("""
+        - 降低仪器展宽参数值
+        - 在【指标化】页面调整寻峰参数以获得更多峰
+        - 上传质量更高、峰更多的实验数据
+        """)
+        
+        st.subheader("📋 各峰数据（排除原因）")
+        _show_wh_peaks_table(wh_result, allow_export=True)
+        return
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "晶粒尺寸 D",
+            f"{wh_result.crystallite_size:.2f} nm",
+            help="由截距反算: D = K·λ / 截距  (K=0.9, λ单位换算为nm)"
+        )
+    
+    with col2:
+        st.metric(
+            "微应变 ε",
+            f"{wh_result.microstrain:.6f}",
+            help="斜率 / 4，通常范围 1e-5 ~ 1e-2"
+        )
+    
+    with col3:
+        st.metric(
+            "拟合 R²",
+            f"{wh_result.r_squared:.4f}",
+            help="加权线性回归的决定系数，越接近1越好"
+        )
+    
+    with col4:
+        st.metric(
+            "参与拟合峰数",
+            f"{wh_result.valid_count}/{wh_result.total_count}"
+        )
+    
+    if wh_result.r_squared < 0.5:
+        st.warning("⚠️ 线性相关性差（R² < 0.5），W-H模型可能不适用于当前数据。"
+                   "建议检查：峰宽数据质量、仪器展宽校正是否合理、样品是否各向同性等。")
+    
+    st.markdown("---")
+    st.subheader("📈 Williamson-Hall分析图")
+    
+    fig = create_wh_plot(wh_result)
+    st.plotly_chart(fig, use_container_width=True)
+    
+    col_export1, _ = st.columns([1, 4])
+    with col_export1:
+        try:
+            png_bytes = fig.to_image(format="png", scale=2.0, width=1200, height=800)
+            st.download_button(
+                "📥 导出PNG",
+                data=png_bytes,
+                file_name="williamson_hall_plot.png",
+                mime="image/png",
+                use_container_width=True
+            )
+        except Exception:
+            try:
+                import kaleido
+                png_bytes = fig.to_image(format="png", scale=2.0)
+                st.download_button(
+                    "📥 导出PNG",
+                    data=png_bytes,
+                    file_name="williamson_hall_plot.png",
+                    mime="image/png",
+                    use_container_width=True
+                )
+            except ImportError:
+                st.info("💡 提示：安装 `kaleido` 包可启用PNG导出功能。当前支持Plotly交互式查看。")
+    
+    st.markdown("---")
+    _show_wh_peaks_table(wh_result, allow_export=True)
+
+
+def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
+    """展示W-H分析的峰数据表格（带标灰样式和导出功能）"""
+    
+    table_data = []
+    styles = []
+    
+    for i, pd_item in enumerate(wh_result.peaks_data):
+        row = {
+            '序号': i + 1,
+            '2θ (°)': round(pd_item.two_theta, 4),
+            'd间距 (Å)': round(pd_item.d_spacing, 4),
+            '实测FWHM (°)': round(pd_item.fwhm_measured, 4) if pd_item.fwhm_measured > 0 else '-',
+            '仪器展宽 (°)': round(pd_item.fwhm_instrument, 4),
+            '样品展宽β (°)': round(pd_item.beta_sample, 4) if not pd_item.excluded else '-',
+            'β·cos(θ) (rad)': f"{pd_item.y_value:.6f}" if not pd_item.excluded else '-',
+            '4·sin(θ)': f"{pd_item.x_value:.6f}" if not pd_item.excluded else '-',
+        }
+        if pd_item.excluded:
+            row['备注'] = f"已排除: {pd_item.exclude_reason}"
+            styles.append(i)
+        else:
+            row['备注'] = f"权重={pd_item.intensity*100:.1f}%"
+        table_data.append(row)
+    
+    df = pd.DataFrame(table_data)
+    
+    if styles:
+        def highlight_excluded(row_idx):
+            return ['background-color: #d3d3d3; color: #808080'] * len(df.columns) if row_idx in styles else [''] * len(df.columns)
+        
+        styled_df = df.style.apply(lambda x: highlight_excluded(x.name), axis=1)
+        st.dataframe(styled_df, use_container_width=True, height=400)
+    else:
+        st.dataframe(df, use_container_width=True, height=400)
+    
+    excluded_count = sum(1 for p in wh_result.peaks_data if p.excluded)
+    if excluded_count > 0:
+        st.caption(f"💡 灰色行表示该峰已被排除（共 {excluded_count} 个），原因通常为：仪器展宽大于实测峰宽。"
+                   f"可尝试降低仪器展宽参数值。")
+    
+    if allow_export:
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+        csv_data = csv_buffer.getvalue()
+        
+        col_export, _ = st.columns([1, 4])
+        with col_export:
+            st.download_button(
+                "📥 导出CSV",
+                data=csv_data,
+                file_name="williamson_hall_peaks.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
 
 def le_bail_section():
@@ -2036,7 +2596,8 @@ def compare_section():
                 shifted_exp_peaks.append(Peak(
                     two_theta=p.two_theta + zero_shift,
                     intensity=p.intensity,
-                    d_spacing=p.d_spacing
+                    d_spacing=p.d_spacing,
+                    fwhm=p.fwhm
                 ))
             matched_exp, unmatched_exp, deviations = match_peaks(shifted_exp_peaks, theo_peaks, tolerance=0.3)
         
@@ -2205,6 +2766,9 @@ elif page == "晶体结构":
 
 elif page == "指标化":
     indexing_section()
+
+elif page == "W-H分析":
+    wh_section()
 
 elif page == "Le Bail拟合":
     le_bail_section()
