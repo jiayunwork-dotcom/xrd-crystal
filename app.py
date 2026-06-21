@@ -630,7 +630,7 @@ def indexing_section():
     
     if uploaded_file is not None:
         try:
-            data = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, comment='#')
+            data = pd.read_csv(uploaded_file, sep='\\s+', engine='python', header=None, comment='#')
             if data.shape[1] < 2:
                 st.error("数据文件需要至少两列: 2theta 和 强度")
                 return
@@ -641,6 +641,10 @@ def indexing_section():
             valid_mask = ~np.isnan(two_theta) & ~np.isnan(intensity)
             two_theta = two_theta[valid_mask]
             intensity = intensity[valid_mask]
+            
+            if len(two_theta) == 0:
+                st.error("有效数据点为0，请检查文件格式")
+                return
             
             sort_idx = np.argsort(two_theta)
             two_theta = two_theta[sort_idx]
@@ -1144,7 +1148,7 @@ def load_compare_experimental_data(uploaded_file):
     返回: two_theta, intensity (已做背景扣除和归一化)
     """
     try:
-        data = pd.read_csv(uploaded_file, sep=None, engine='python', header=None, comment='#')
+        data = pd.read_csv(uploaded_file, sep='\\s+', engine='python', header=None, comment='#')
         if data.shape[1] < 2:
             return None, None, "数据文件需要至少两列: 2theta 和 强度"
         
@@ -1154,6 +1158,9 @@ def load_compare_experimental_data(uploaded_file):
         valid_mask = ~np.isnan(two_theta) & ~np.isnan(intensity)
         two_theta = two_theta[valid_mask]
         intensity = intensity[valid_mask]
+        
+        if len(two_theta) == 0:
+            return None, None, "有效数据点为0，请检查文件格式"
         
         sort_idx = np.argsort(two_theta)
         two_theta = two_theta[sort_idx]
