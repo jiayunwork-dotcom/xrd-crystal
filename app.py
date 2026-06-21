@@ -1134,11 +1134,29 @@ def _quant_manual_crystal_input():
     """定量分析页面内手动定义晶相"""
     st.markdown("#### ✏️ 手动定义新晶相")
     
-    with st.form("quant_manual_crystal_form"):
+    if 'qa_atom_list' not in st.session_state:
+        st.session_state.qa_atom_list = [
+            {"element": "Si", "x": 0.0, "y": 0.0, "z": 0.0, "occupancy": 1.0, "b_iso": 0.5},
+        ]
+    
+    if 'qa_phase_count' not in st.session_state:
+        st.session_state.qa_phase_count = 1
+    
+    col_add_btn, _ = st.columns([1, 3])
+    with col_add_btn:
+        if st.button("➕ 添加原子", key="qa_add_atom_btn", use_container_width=True):
+            st.session_state.qa_atom_list.append({
+                "element": "C", "x": 0.0, "y": 0.0, "z": 0.0,
+                "occupancy": 1.0, "b_iso": 1.0
+            })
+            st.rerun()
+    
+    with st.form("quant_manual_crystal_form", clear_on_submit=False):
         sg_input = st.text_input(
             "空间群 (H-M符号或编号)",
             value="Fd-3m",
-            help="例如: P1, Fm-3m, 225 等"
+            help="例如: P1, Fm-3m, 225 等",
+            key="qa_sg_input"
         )
         
         try:
@@ -1150,67 +1168,53 @@ def _quant_manual_crystal_input():
         
         col_a, col_b, col_c = st.columns(3)
         with col_a:
-            qa = st.number_input("a (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_a")
+            qa = st.number_input("a (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_a_in")
         with col_b:
-            qb = st.number_input("b (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_b")
+            qb = st.number_input("b (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_b_in")
         with col_c:
-            qc = st.number_input("c (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_c")
+            qc = st.number_input("c (Å)", value=5.4309, step=0.001, format="%.4f", key="qa_c_in")
         
         col_alpha, col_beta, col_gamma = st.columns(3)
         with col_alpha:
-            qalpha = st.number_input("α (°)", value=90.0, step=0.1, format="%.2f", key="qa_alpha")
+            qalpha = st.number_input("α (°)", value=90.0, step=0.1, format="%.2f", key="qa_alpha_in")
         with col_beta:
-            qbeta = st.number_input("β (°)", value=90.0, step=0.1, format="%.2f", key="qa_beta")
+            qbeta = st.number_input("β (°)", value=90.0, step=0.1, format="%.2f", key="qa_beta_in")
         with col_gamma:
-            qgamma = st.number_input("γ (°)", value=90.0, step=0.1, format="%.2f", key="qa_gamma")
+            qgamma = st.number_input("γ (°)", value=90.0, step=0.1, format="%.2f", key="qa_gamma_in")
         
-        crystal_name_q = st.text_input("晶体名称", value="自定义晶体", key="qa_crystal_name")
-        
-        if 'qa_atom_list' not in st.session_state:
-            st.session_state.qa_atom_list = [
-                {"element": "Si", "x": 0.0, "y": 0.0, "z": 0.0, "occupancy": 1.0, "b_iso": 0.5},
-            ]
+        crystal_name_q = st.text_input("晶体名称", value="自定义晶体", key="qa_crystal_name_in")
         
         st.markdown("**原子列表**")
-        atoms_to_del = []
         for i, atom in enumerate(st.session_state.qa_atom_list):
             with st.expander(f"原子 {i+1}: {atom['element']}", expanded=(i < 2)):
                 col_e, col_x, col_y = st.columns(3)
                 with col_e:
-                    atom['element'] = st.text_input("元素", value=atom['element'], key=f"qa_elem_{i}")
+                    atom['element'] = st.text_input("元素", value=atom['element'], key=f"qa_elem_{i}_in")
                 with col_x:
-                    atom['x'] = st.number_input("x", value=float(atom['x']), step=0.01, format="%.4f", key=f"qa_x_{i}")
+                    atom['x'] = st.number_input("x", value=float(atom['x']), step=0.01, format="%.4f", key=f"qa_x_{i}_in")
                 with col_y:
-                    atom['y'] = st.number_input("y", value=float(atom['y']), step=0.01, format="%.4f", key=f"qa_y_{i}")
+                    atom['y'] = st.number_input("y", value=float(atom['y']), step=0.01, format="%.4f", key=f"qa_y_{i}_in")
                 col_z, col_occ, col_b = st.columns(3)
                 with col_z:
-                    atom['z'] = st.number_input("z", value=float(atom['z']), step=0.01, format="%.4f", key=f"qa_z_{i}")
+                    atom['z'] = st.number_input("z", value=float(atom['z']), step=0.01, format="%.4f", key=f"qa_z_{i}_in")
                 with col_occ:
-                    atom['occupancy'] = st.number_input("占位", value=float(atom['occupancy']), min_value=0.0, max_value=1.0, step=0.1, key=f"qa_occ_{i}")
+                    atom['occupancy'] = st.number_input("占位", value=float(atom['occupancy']), min_value=0.0, max_value=1.0, step=0.1, key=f"qa_occ_{i}_in")
                 with col_b:
-                    atom['b_iso'] = st.number_input("B_iso", value=float(atom['b_iso']), step=0.1, key=f"qa_b_{i}")
+                    atom['b_iso'] = st.number_input("B_iso", value=float(atom['b_iso']), step=0.1, key=f"qa_b_{i}_in")
                 
-                if st.button(f"删除原子 {i+1}", key=f"qa_del_atom_{i}"):
-                    atoms_to_del.append(i)
+                if st.form_submit_button(f"🗑️ 删除原子 {i+1}", key=f"qa_del_atom_{i}_btn", use_container_width=True):
+                    if len(st.session_state.qa_atom_list) > 1:
+                        st.session_state.qa_atom_list.pop(i)
+                        st.rerun()
+                    else:
+                        st.warning("至少需要保留一个原子")
         
-        for idx in reversed(atoms_to_del):
-            st.session_state.qa_atom_list.pop(idx)
-        
-        col_add, col_submit = st.columns([1, 1])
-        with col_add:
-            if st.form_submit_button("➕ 添加原子"):
-                st.session_state.qa_atom_list.append({
-                    "element": "C", "x": 0.0, "y": 0.0, "z": 0.0,
-                    "occupancy": 1.0, "b_iso": 1.0
-                })
-                st.rerun()
-        
-        with col_submit:
-            submitted = st.form_submit_button("✅ 保存此晶相", type="primary")
-            if submitted:
-                if len(st.session_state.qa_atom_list) == 0:
-                    st.warning("请至少添加一个原子")
-                else:
+        submitted = st.form_submit_button("✅ 添加到晶相列表", type="primary", use_container_width=True)
+        if submitted:
+            if len(st.session_state.qa_atom_list) == 0:
+                st.warning("请至少添加一个原子")
+            else:
+                try:
                     crystal_q = Crystal(
                         a=qa, b=qb, c=qc,
                         alpha=qalpha, beta=qbeta, gamma=qgamma,
@@ -1226,14 +1230,25 @@ def _quant_manual_crystal_input():
                             atom_data['b_iso']
                         )
                     
-                    phase_name_q = f"定量相_{len(st.session_state.phases) + 1}"
+                    while True:
+                        phase_name_q = f"定量相_{st.session_state.qa_phase_count}"
+                        st.session_state.qa_phase_count += 1
+                        if phase_name_q not in st.session_state.crystals:
+                            break
+                    
                     st.session_state.crystals[phase_name_q] = crystal_q
                     if phase_name_q not in st.session_state.phases:
                         st.session_state.phases.append(phase_name_q)
                         st.session_state.phase_ratios[phase_name_q] = 1.0
                     
-                    st.success(f"已保存晶相: {phase_name_q} ({crystal_name_q}")
+                    st.success(f"✅ 已保存: {phase_name_q} ({crystal_name_q})")
+                    st.info(f"下方勾选列表已更新，可选中此晶相进行定量分析")
                     st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"保存失败: {e}")
+                    import traceback
+                    st.error(traceback.format_exc())
 
 
 def _format_weight_std(weight_std_value):

@@ -249,42 +249,42 @@ def quantitative_analysis(
         lower_bounds = np.concatenate([np.zeros(n_phases), -np.inf * np.ones(n_bg_coeffs)])
         upper_bounds = np.inf * np.ones(n_params_total)
         
-        def residuals_func(p):
+        call_counter = [0]
+        last_rwp = [None]
+        
+        def residuals_func_wrapped(p):
+            call_counter[0] += 1
             calculated = _compute_pattern_from_params(
                 p, phase_patterns_list, intensity_norm, x_normalized
             )
             valid = intensity_norm > 0
             w_vec = np.zeros_like(intensity_norm)
             w_vec[valid] = 1.0 / np.maximum(intensity_norm[valid], 1e-6)
+            
+            if call_counter[0] % 5 == 0 or call_counter[0] == 1:
+                current_rwp = _calculate_Rwp(intensity_norm, calculated)
+                rwp_history.append(current_rwp)
+                last_rwp[0] = current_rwp
+                if progress_callback is not None:
+                    overall_iter = call_counter[0] + phase_elimination_round * (max_iterations // 4)
+                    overall_max = max_iterations * total_phases_initial
+                    try:
+                        progress_callback(min(overall_iter, overall_max), overall_max, current_rwp)
+                    except Exception:
+                        pass
+            
             return (intensity_norm - calculated) * np.sqrt(w_vec)
-        
-        callback_nfev = [0]
-        def least_squares_callback(xk, info):
-            callback_nfev[0] += 1
-            current_calc = _compute_pattern_from_params(
-                xk, phase_patterns_list, intensity_norm, x_normalized
-            )
-            current_rwp = _calculate_Rwp(intensity_norm, current_calc)
-            rwp_history.append(current_rwp)
-            if progress_callback is not None:
-                overall_iter = callback_nfev[0] + phase_elimination_round * (max_iterations // 4)
-                overall_max = max_iterations * total_phases_initial
-                try:
-                    progress_callback(min(overall_iter, overall_max), overall_max, current_rwp)
-                except Exception:
-                    pass
         
         try:
             result = least_squares(
-                residuals_func,
+                residuals_func_wrapped,
                 params0,
                 bounds=(lower_bounds, upper_bounds),
                 method='trf',
                 max_nfev=max_iterations,
                 ftol=tolerance,
                 xtol=tolerance,
-                gtol=tolerance,
-                callback=least_squares_callback
+                gtol=tolerance
             )
             
             opt_params = result.x
