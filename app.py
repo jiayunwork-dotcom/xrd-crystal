@@ -735,7 +735,7 @@ def indexing_section():
         with col2:
             min_distance = st.slider("最小峰间距 (°)", 0.1, 2.0, 0.3, 0.1)
         with col3:
-            min_peak_height = st.slider("最小突出度 (%)", 0.5, 20, 2, 0.5)
+            min_peak_height = st.slider("最小突出度 (%)", 0.5, 20.0, 2.0, 0.5)
         
         if st.button("🔎 寻峰", type="primary"):
             with st.spinner("正在寻峰..."):
@@ -1304,7 +1304,7 @@ def wh_section():
         st.metric(
             "微应变 ε",
             f"{wh_result.microstrain:.6f}",
-            help="斜率 / 4，通常范围 1e-5 ~ 1e-2"
+            help="拟合直线的斜率 (x轴=4·sinθ)，通常范围 1e-5 ~ 1e-2"
         )
     
     with col3:
@@ -1371,6 +1371,7 @@ def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
             '2θ (°)': round(pd_item.two_theta, 4),
             'd间距 (Å)': round(pd_item.d_spacing, 4),
             '实测FWHM (°)': round(pd_item.fwhm_measured, 4) if pd_item.fwhm_measured > 0 else '-',
+            '强度 (%)': round(pd_item.intensity * 100, 2),
             '仪器展宽 (°)': round(pd_item.fwhm_instrument, 4),
             '样品展宽β (°)': round(pd_item.beta_sample, 4) if not pd_item.excluded else '-',
             'β·cos(θ) (rad)': f"{pd_item.y_value:.6f}" if not pd_item.excluded else '-',
