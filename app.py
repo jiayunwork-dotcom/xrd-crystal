@@ -1492,11 +1492,12 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
             hovertexts = []
             for p in valid_peaks:
                 hkl_str = f"({p.hkl[0]}{p.hkl[1]}{p.hkl[2]})" if p.hkl else "?"
+                e_str = f"{p.e_hkl:.2f}" if p.e_hkl and p.e_hkl > 0 else "N/A"
                 hovertexts.append(
                     f"hkl = {hkl_str}<br>"
                     f"2θ = {p.two_theta:.3f}°<br>"
                     f"d间距 = {p.d_spacing:.4f} Å<br>"
-                    f"E(hkl) = {p.e_hkl:.2f} GPa<br>"
+                    f"E(hkl) = {e_str} GPa<br>"
                     f"强度 = {p.intensity*100:.1f}%<br>"
                     f"权重 = {p.intensity*100:.1f}%<br>"
                     f"实测FWHM = {p.fwhm_measured:.4f}°<br>"
@@ -1987,8 +1988,11 @@ def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
         }
         if is_usdm:
             hkl_str = f"({pd_item.hkl[0]}{pd_item.hkl[1]}{pd_item.hkl[2]})" if pd_item.hkl else "未确定"
-            row.insert(2, 'hkl', hkl_str)
-            row.insert(3, 'E(hkl) (GPa)', f"{pd_item.e_hkl:.2f}" if pd_item.e_hkl and pd_item.e_hkl > 0 else '-')
+            e_str = f"{pd_item.e_hkl:.2f}" if pd_item.e_hkl and pd_item.e_hkl > 0 else '-'
+            items = list(row.items())
+            items.insert(2, ('hkl', hkl_str))
+            items.insert(3, ('E(hkl) (GPa)', e_str))
+            row = dict(items)
             if not pd_item.excluded:
                 row['4·sin(θ)/E (GPa⁻¹)'] = f"{pd_item.x_value:.6f}"
         else:
