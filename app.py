@@ -1115,14 +1115,16 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
         ))
     
     if wh_result.valid_peaks_x:
-        marker_sizes = 8 + 8 * np.array(wh_result.valid_peaks_intensity)
+        marker_sizes = 8 + 12 * np.array(wh_result.valid_peaks_intensity)
         marker_sizes = np.clip(marker_sizes, 8, 20)
+        
+        valid_peaks = [p for p in wh_result.peaks_data if not p.excluded]
         
         fig.add_trace(go.Scatter(
             x=wh_result.valid_peaks_x,
             y=wh_result.valid_peaks_y,
             mode='markers',
-            name='有效峰',
+            name='有效峰（大小=权重）',
             marker=dict(
                 color='#1f77b4',
                 size=marker_sizes.tolist(),
@@ -1130,9 +1132,16 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
                 line=dict(width=1, color='black')
             ),
             hovertext=[
-                f"2θ={p.two_theta:.3f}°<br>d={p.d_spacing:.4f} Å<br>"
-                f"强度={p.intensity*100:.1f}%<br>β={p.beta_sample:.4f}°"
-                for p in wh_result.peaks_data if not p.excluded
+                f"2θ = {p.two_theta:.3f}°<br>"
+                f"d间距 = {p.d_spacing:.4f} Å<br>"
+                f"强度 = {p.intensity*100:.1f}%<br>"
+                f"权重 = {p.intensity*100:.1f}%<br>"
+                f"实测FWHM = {p.fwhm_measured:.4f}°<br>"
+                f"仪器展宽 = {p.fwhm_instrument:.4f}°<br>"
+                f"样品展宽β = {p.beta_sample:.4f}°<br>"
+                f"4·sin(θ) = {p.x_value:.6f}<br>"
+                f"β·cos(θ) = {p.y_value:.6f} rad"
+                for p in valid_peaks
             ],
             hoverinfo='text'
         ))
@@ -1333,18 +1342,14 @@ def wh_section():
     col_export1, _ = st.columns([1, 4])
     with col_export1:
         try:
-            png_bytes = fig.to_image(format="png", scale=2.0, width=1200, height=800)
-            st.download_button(
-                "📥 导出PNG",
-                data=png_bytes,
-                file_name="williamson_hall_plot.png",
-                mime="image/png",
-                use_container_width=True
-            )
-        except Exception:
+            import kaleido
+            png_available = True
+        except ImportError:
+            png_available = False
+        
+        if png_available:
             try:
-                import kaleido
-                png_bytes = fig.to_image(format="png", scale=2.0)
+                png_bytes = fig.to_image(format="png", scale=2.0, width=1200, height=800)
                 st.download_button(
                     "📥 导出PNG",
                     data=png_bytes,
@@ -1352,8 +1357,10 @@ def wh_section():
                     mime="image/png",
                     use_container_width=True
                 )
-            except ImportError:
-                st.info("💡 提示：安装 `kaleido` 包可启用PNG导出功能。当前支持Plotly交互式查看。")
+            except Exception as e:
+                st.info(f"💡 PNG导出不可用（{type(e).__name__}）。当前支持Plotly交互式查看。")
+        else:
+            st.info("💡 提示：安装 `kaleido` 包可启用PNG导出功能。当前支持Plotly交互式查看。")
     
     st.markdown("---")
     _show_wh_peaks_table(wh_result, allow_export=True)

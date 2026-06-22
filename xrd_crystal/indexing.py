@@ -35,14 +35,16 @@ class IndexingResult:
 
 def estimate_fwhm(two_theta: np.ndarray, 
                   intensity: np.ndarray, 
-                  peak_idx: int) -> float:
+                  peak_idx: int,
+                  window_points: int = 20) -> float:
     """
-    估算峰的半高宽(FWHM)
+    估算峰的半高宽(FWHM)，带局部基线估计
     
     参数:
         two_theta: 2theta数组
-        intensity: 强度数组
+        intensity: 强度数组（已扣除背景）
         peak_idx: 峰顶点的索引
+        window_points: 估计局部基线的窗口点数（峰两侧各取多少点）
     
     返回:
         FWHM值 (度)，如果无法估算则返回0.0
@@ -52,7 +54,21 @@ def estimate_fwhm(two_theta: np.ndarray,
         return 0.0
     
     peak_height = intensity[peak_idx]
-    half_height = peak_height / 2.0
+    
+    left_start = max(0, peak_idx - window_points)
+    left_end = max(0, peak_idx - window_points // 3)
+    right_start = min(n - 1, peak_idx + window_points // 3)
+    right_end = min(n - 1, peak_idx + window_points)
+    
+    left_bkg = np.median(intensity[left_start:left_end + 1]) if left_end > left_start else 0.0
+    right_bkg = np.median(intensity[right_start:right_end + 1]) if right_end > right_start else 0.0
+    local_baseline = (left_bkg + right_bkg) / 2.0
+    
+    if local_baseline >= peak_height * 0.9:
+        local_baseline = 0.0
+    
+    net_height = peak_height - local_baseline
+    half_height = local_baseline + net_height / 2.0
     
     left_idx = peak_idx
     while left_idx > 0 and intensity[left_idx] > half_height:
