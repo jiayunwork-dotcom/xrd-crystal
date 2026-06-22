@@ -137,6 +137,27 @@ def init_session_state():
     
     if 'wh_result' not in st.session_state:
         st.session_state.wh_result = None
+    
+    if 'wh_result_udm' not in st.session_state:
+        st.session_state.wh_result_udm = None
+    
+    if 'wh_result_usdm' not in st.session_state:
+        st.session_state.wh_result_usdm = None
+    
+    if 'wh_mode' not in st.session_state:
+        st.session_state.wh_mode = "UDM"
+    
+    if 'wh_usdm_material' not in st.session_state:
+        st.session_state.wh_usdm_material = None
+    
+    if 'wh_usdm_use_builtin' not in st.session_state:
+        st.session_state.wh_usdm_use_builtin = True
+    
+    if 'wh_usdm_custom_e' not in st.session_state:
+        st.session_state.wh_usdm_custom_e = {}
+    
+    if 'wh_hkl_list' not in st.session_state:
+        st.session_state.wh_hkl_list = None
 
 
 def create_default_crystal() -> Crystal:
@@ -889,6 +910,8 @@ class WHPeakData:
     y_value: float
     excluded: bool
     exclude_reason: str
+    hkl: tuple = None
+    e_hkl: float = None
 
 
 @dataclass
@@ -907,6 +930,348 @@ class WHResult:
     valid_peaks_intensity: list
     fit_line_x: list
     fit_line_y: list
+    mode: str = "UDM"
+    stress_mpa: float = 0.0
+    all_e_same: bool = False
+
+
+BUILTIN_MATERIALS = {
+    "Cu (铜)": {
+        "S11": 14.98e-3,
+        "S12": -6.28e-3,
+        "S44": 13.29e-3,
+        "description": "面心立方, 柔顺系数单位: GPa^-1 (文献值)"
+    },
+    "Al (铝)": {
+        "S11": 15.70e-3,
+        "S12": -5.68e-3,
+        "S44": 35.10e-3,
+        "description": "面心立方, 柔顺系数单位: GPa^-1 (文献值)"
+    },
+    "Fe (铁-α)": {
+        "S11": 7.72e-3,
+        "S12": -2.77e-3,
+        "S44": 8.84e-3,
+        "description": "体心立方, 柔顺系数单位: GPa^-1 (文献值)"
+    },
+    "Si (硅)": {
+        "S11": 7.68e-3,
+        "S12": -2.14e-3,
+        "S44": 12.56e-3,
+        "description": "金刚石结构, 柔顺系数单位: GPa^-1 (文献值)"
+    },
+    "ZnO (氧化锌)": {
+        "S11": 7.95e-3,
+        "S12": -3.06e-3,
+        "S44": 23.55e-3,
+        "S13": -1.45e-3,
+        "S33": 6.93e-3,
+        "crystal_system": "hexagonal",
+        "description": "六方纤锌矿结构 (注意: 本工具暂仅支持立方晶系各向异性计算)"
+    }
+}
+
+
+def compute_cubic_youngs_modulus(h: int, k: int, l: int, S11: float, S12: float, S44: float) -> float:
+    """
+    立方晶系各向异性杨氏模量计算
+    
+    1/E(hkl) = S11 - 2*(S11 - S12 - S44/2)*(h²k² + k²l² + l²h²)/(h² + k² + l²)²
+    
+    参数:
+        h, k, l: 晶面指数
+        S11, S12, S44: 柔顺系数 (单位: GPa^-1)
+    
+    返回:
+        E(hkl): 杨氏模量 (单位: GPa)
+    """
+    h2, k2, l2 = h * h, k * k, l * l
+    sum_sq = h2 + k2 + l2
+    if sum_sq == 0:
+        return 0.0
+    cross_terms = h2 * k2 + k2 * l2 + l2 * h2
+    factor = 2.0 * (S11 - S12 - 0.5 * S44) * cross_terms / (sum_sq * sum_sq)
+    inv_E = S11 - factor
+    if inv_E <= 0:
+        return 0.0
+    return 1.0 / inv_E
+
+
+def match_hkl_for_peaks(peaks: list, crystal: Crystal, wavelength: float, tolerance: float = 0.02) -> list:
+    """
+    为实验峰匹配hkl指数
+    
+    参数:
+        peaks: Peak对象列表
+        crystal: Crystal对象
+        wavelength: X射线波长 (Å)
+        tolerance: 相对容差
+    
+    返回:
+        (h, k, l) 列表，对应每个峰；无法匹配则为None
+    """
+    try:
+        theo_peaks = diffraction_simulation(
+            crystal,
+            wavelength=wavelength,
+            two_theta_min=max(0.0, min(p.two_theta for p in peaks) - 2.0),
+            two_theta_max=max(p.two_theta for p in peaks) + 2.0,
+            use_symmetry=True
+        )
+    except Exception:
+        return [None] * len(peaks)
+    
+    hkl_matches = []
+    for peak in peaks:
+        best_match = None
+        best_diff = float('inf')
+        for theo in theo_peaks:
+            rel_diff = abs(peak.two_theta - theo.two_theta) / peak.two_theta
+            if rel_diff < best_diff and rel_diff < tolerance:
+                best_diff = rel_diff
+                best_match = (theo.h, theo.k, theo.l)
+        hkl_matches.append(best_match)
+    
+    return hkl_matches
+
+
+def williamson_hall_analysis_usdm(
+    peaks: list,
+    wavelength: float,
+    use_caglioti: bool,
+    fwhm_fixed: float,
+    U: float, V: float, W: float,
+    hkl_list: list,
+    e_hkl_list: list,
+    K: float = 0.9
+) -> WHResult:
+    """
+    各向异性Williamson-Hall (USDM) 分析核心计算
+    
+    公式: beta*cos(theta) = K*lambda/D + 4*sigma*sin(theta)/E(hkl)
+    
+    参数:
+        peaks: Peak对象列表
+        wavelength: X射线波长 (Å)
+        use_caglioti: 是否使用Caglioti公式计算仪器展宽
+        fwhm_fixed: 固定仪器FWHM值 (°)
+        U, V, W: Caglioti公式参数
+        hkl_list: 每个峰对应的(h,k,l)元组列表
+        e_hkl_list: 每个峰对应的E(hkl)值列表 (GPa)
+        K: Scherrer公式形状因子 (默认0.9)
+    
+    返回:
+        WHResult对象
+    """
+    peaks_data = []
+    valid_x = []
+    valid_y = []
+    valid_weights = []
+    
+    valid_e_values = [e for e in e_hkl_list if e is not None and e > 0]
+    all_e_same = False
+    if valid_e_values:
+        e_arr = np.array(valid_e_values)
+        rel_std = np.std(e_arr) / np.mean(e_arr) if np.mean(e_arr) > 0 else 0
+        all_e_same = rel_std < 0.001
+    
+    for i, peak in enumerate(peaks):
+        two_theta = peak.two_theta
+        intensity = peak.intensity
+        fwhm_measured = peak.fwhm
+        hkl = hkl_list[i] if i < len(hkl_list) else None
+        e_hkl = e_hkl_list[i] if i < len(e_hkl_list) else None
+        
+        if fwhm_measured <= 0:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=0.0,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="FWHM未能估算",
+                hkl=hkl,
+                e_hkl=e_hkl
+            ))
+            continue
+        
+        if hkl is None:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=0.0,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="hkl未确定",
+                hkl=hkl,
+                e_hkl=e_hkl
+            ))
+            continue
+        
+        if e_hkl is None or e_hkl <= 0:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=0.0,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="E(hkl)异常(≤0)",
+                hkl=hkl,
+                e_hkl=e_hkl
+            ))
+            continue
+        
+        if use_caglioti:
+            fwhm_instrument = caglioti_fwhm(two_theta, U, V, W, wavelength)
+        else:
+            fwhm_instrument = fwhm_fixed
+        
+        beta_sq = fwhm_measured**2 - fwhm_instrument**2
+        
+        if beta_sq <= 0:
+            peaks_data.append(WHPeakData(
+                two_theta=two_theta,
+                d_spacing=peak.d_spacing,
+                fwhm_measured=fwhm_measured,
+                fwhm_instrument=fwhm_instrument,
+                beta_sample=0.0,
+                intensity=intensity,
+                x_value=0.0,
+                y_value=0.0,
+                excluded=True,
+                exclude_reason="实测FWHM≤仪器展宽",
+                hkl=hkl,
+                e_hkl=e_hkl
+            ))
+            continue
+        
+        beta_sample = np.sqrt(beta_sq)
+        beta_sample_rad = np.deg2rad(beta_sample)
+        
+        theta_rad = np.deg2rad(two_theta / 2.0)
+        x_val = 4.0 * np.sin(theta_rad) / e_hkl
+        y_val = beta_sample_rad * np.cos(theta_rad)
+        
+        peaks_data.append(WHPeakData(
+            two_theta=two_theta,
+            d_spacing=peak.d_spacing,
+            fwhm_measured=fwhm_measured,
+            fwhm_instrument=fwhm_instrument,
+            beta_sample=beta_sample,
+            intensity=intensity,
+            x_value=x_val,
+            y_value=y_val,
+            excluded=False,
+            exclude_reason="",
+            hkl=hkl,
+            e_hkl=e_hkl
+        ))
+        
+        valid_x.append(x_val)
+        valid_y.append(y_val)
+        valid_weights.append(intensity)
+    
+    total_count = len(peaks_data)
+    valid_count = len(valid_x)
+    
+    if valid_count < 3:
+        return WHResult(
+            peaks_data=peaks_data,
+            valid_count=valid_count,
+            total_count=total_count,
+            slope=0.0,
+            intercept=0.0,
+            r_squared=0.0,
+            crystallite_size=0.0,
+            microstrain=0.0,
+            valid_peaks_x=[],
+            valid_peaks_y=[],
+            valid_peaks_intensity=[],
+            fit_line_x=[],
+            fit_line_y=[],
+            mode="USDM",
+            stress_mpa=0.0,
+            all_e_same=all_e_same
+        )
+    
+    valid_x_arr = np.array(valid_x)
+    valid_y_arr = np.array(valid_y)
+    weights_arr = np.array(valid_weights)
+    weights_norm = weights_arr / np.sum(weights_arr)
+    
+    def weighted_linear_regression(x, y, w):
+        sum_w = np.sum(w)
+        sum_wx = np.sum(w * x)
+        sum_wy = np.sum(w * y)
+        sum_wxx = np.sum(w * x * x)
+        sum_wxy = np.sum(w * x * y)
+        
+        denominator = sum_w * sum_wxx - sum_wx**2
+        
+        if abs(denominator) < 1e-15:
+            return 0.0, np.mean(y), 0.0
+        
+        slope = (sum_w * sum_wxy - sum_wx * sum_wy) / denominator
+        intercept = (sum_wy - slope * sum_wx) / sum_w
+        
+        y_pred = slope * x + intercept
+        ss_tot = np.sum(w * (y - np.sum(w * y) / sum_w)**2)
+        ss_res = np.sum(w * (y - y_pred)**2)
+        
+        if ss_tot < 1e-15:
+            r_squared = 1.0 if ss_res < 1e-15 else 0.0
+        else:
+            r_squared = 1.0 - ss_res / ss_tot
+        
+        return slope, intercept, r_squared
+    
+    slope, intercept, r_squared = weighted_linear_regression(
+        valid_x_arr, valid_y_arr, weights_norm
+    )
+    
+    wavelength_nm = wavelength * 0.1
+    if abs(intercept) > 1e-15:
+        crystallite_size_nm = K * wavelength_nm / intercept
+    else:
+        crystallite_size_nm = 0.0
+    
+    stress_mpa = slope
+    
+    x_min, x_max = np.min(valid_x_arr), np.max(valid_x_arr)
+    x_pad = (x_max - x_min) * 0.1 if x_max > x_min else 0.01
+    fit_line_x = np.linspace(x_min - x_pad, x_max + x_pad, 100)
+    fit_line_y = slope * fit_line_x + intercept
+    
+    return WHResult(
+        peaks_data=peaks_data,
+        valid_count=valid_count,
+        total_count=total_count,
+        slope=slope,
+        intercept=intercept,
+        r_squared=r_squared,
+        crystallite_size=crystallite_size_nm,
+        microstrain=0.0,
+        valid_peaks_x=valid_x,
+        valid_peaks_y=valid_y,
+        valid_peaks_intensity=[p.intensity for p in peaks_data if not p.excluded],
+        fit_line_x=fit_line_x.tolist(),
+        fit_line_y=fit_line_y.tolist(),
+        mode="USDM",
+        stress_mpa=stress_mpa,
+        all_e_same=all_e_same
+    )
 
 
 def williamson_hall_analysis(
@@ -1019,7 +1384,8 @@ def williamson_hall_analysis(
             valid_peaks_y=[],
             valid_peaks_intensity=[],
             fit_line_x=[],
-            fit_line_y=[]
+            fit_line_y=[],
+            mode="UDM"
         )
     
     valid_x_arr = np.array(valid_x)
@@ -1084,13 +1450,15 @@ def williamson_hall_analysis(
         valid_peaks_y=valid_y,
         valid_peaks_intensity=[p.intensity for p in peaks_data if not p.excluded],
         fit_line_x=fit_line_x.tolist(),
-        fit_line_y=fit_line_y.tolist()
+        fit_line_y=fit_line_y.tolist(),
+        mode="UDM"
     )
 
 
 def create_wh_plot(wh_result: WHResult) -> go.Figure:
-    """创建Williamson-Hall图"""
+    """创建Williamson-Hall图 (支持UDM和USDM两种模式)"""
     fig = go.Figure()
+    is_usdm = wh_result.mode == "USDM"
     
     excluded_x = [p.x_value for p in wh_result.peaks_data if p.excluded and p.fwhm_measured > 0]
     excluded_y = [p.y_value for p in wh_result.peaks_data if p.excluded and p.fwhm_measured > 0]
@@ -1120,6 +1488,41 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
         
         valid_peaks = [p for p in wh_result.peaks_data if not p.excluded]
         
+        if is_usdm:
+            hovertexts = []
+            for p in valid_peaks:
+                hkl_str = f"({p.hkl[0]}{p.hkl[1]}{p.hkl[2]})" if p.hkl else "?"
+                hovertexts.append(
+                    f"hkl = {hkl_str}<br>"
+                    f"2θ = {p.two_theta:.3f}°<br>"
+                    f"d间距 = {p.d_spacing:.4f} Å<br>"
+                    f"E(hkl) = {p.e_hkl:.2f} GPa<br>"
+                    f"强度 = {p.intensity*100:.1f}%<br>"
+                    f"权重 = {p.intensity*100:.1f}%<br>"
+                    f"实测FWHM = {p.fwhm_measured:.4f}°<br>"
+                    f"仪器展宽 = {p.fwhm_instrument:.4f}°<br>"
+                    f"样品展宽β = {p.beta_sample:.4f}°<br>"
+                    f"4·sin(θ)/E = {p.x_value:.6f} GPa⁻¹<br>"
+                    f"β·cos(θ) = {p.y_value:.6f} rad"
+                )
+            xaxis_label = "4·sin(θ)/E(hkl) (GPa⁻¹)"
+            plot_title = "各向异性Williamson-Hall分析图 (USDM)"
+        else:
+            hovertexts = [
+                f"2θ = {p.two_theta:.3f}°<br>"
+                f"d间距 = {p.d_spacing:.4f} Å<br>"
+                f"强度 = {p.intensity*100:.1f}%<br>"
+                f"权重 = {p.intensity*100:.1f}%<br>"
+                f"实测FWHM = {p.fwhm_measured:.4f}°<br>"
+                f"仪器展宽 = {p.fwhm_instrument:.4f}°<br>"
+                f"样品展宽β = {p.beta_sample:.4f}°<br>"
+                f"4·sin(θ) = {p.x_value:.6f}<br>"
+                f"β·cos(θ) = {p.y_value:.6f} rad"
+                for p in valid_peaks
+            ]
+            xaxis_label = "4·sin(θ)"
+            plot_title = "Williamson-Hall分析图 (UDM)"
+        
         fig.add_trace(go.Scatter(
             x=wh_result.valid_peaks_x,
             y=wh_result.valid_peaks_y,
@@ -1131,18 +1534,7 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
                 symbol='circle',
                 line=dict(width=1, color='black')
             ),
-            hovertext=[
-                f"2θ = {p.two_theta:.3f}°<br>"
-                f"d间距 = {p.d_spacing:.4f} Å<br>"
-                f"强度 = {p.intensity*100:.1f}%<br>"
-                f"权重 = {p.intensity*100:.1f}%<br>"
-                f"实测FWHM = {p.fwhm_measured:.4f}°<br>"
-                f"仪器展宽 = {p.fwhm_instrument:.4f}°<br>"
-                f"样品展宽β = {p.beta_sample:.4f}°<br>"
-                f"4·sin(θ) = {p.x_value:.6f}<br>"
-                f"β·cos(θ) = {p.y_value:.6f} rad"
-                for p in valid_peaks
-            ],
+            hovertext=hovertexts,
             hoverinfo='text'
         ))
     
@@ -1155,11 +1547,18 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
             line=dict(color='#d62728', width=2, dash='solid')
         ))
     
-    annotation_text = (
-        f"斜率 = {wh_result.slope:.6f} (ε = {wh_result.microstrain:.4f})<br>"
-        f"截距 = {wh_result.intercept:.6f} (D = {wh_result.crystallite_size:.2f} nm)<br>"
-        f"R² = {wh_result.r_squared:.4f}"
-    )
+    if is_usdm:
+        annotation_text = (
+            f"斜率 σ = {wh_result.stress_mpa:.4f} MPa<br>"
+            f"截距 = {wh_result.intercept:.6f} (D = {wh_result.crystallite_size:.2f} nm)<br>"
+            f"R² = {wh_result.r_squared:.4f}"
+        )
+    else:
+        annotation_text = (
+            f"斜率 = {wh_result.slope:.6f} (ε = {wh_result.microstrain:.4f})<br>"
+            f"截距 = {wh_result.intercept:.6f} (D = {wh_result.crystallite_size:.2f} nm)<br>"
+            f"R² = {wh_result.r_squared:.4f}"
+        )
     
     fig.add_annotation(
         xref="paper", yref="paper",
@@ -1175,8 +1574,8 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
     )
     
     fig.update_layout(
-        title="Williamson-Hall分析图",
-        xaxis_title="4·sin(θ)",
+        title=plot_title,
+        xaxis_title=xaxis_label,
         yaxis_title="β·cos(θ) (rad)",
         height=500,
         legend=dict(orientation='h', y=1.02),
@@ -1187,14 +1586,13 @@ def create_wh_plot(wh_result: WHResult) -> go.Figure:
 
 
 def wh_section():
-    """Williamson-Hall分析页面"""
+    """Williamson-Hall分析页面 (支持UDM和USDM两种模式)"""
     st.header("📐 Williamson-Hall分析")
     
     st.markdown("""
-    **原理说明**: Williamson-Hall方法通过分析各衍射峰的展宽，分离晶粒尺寸细化和微应变两个贡献。
-    - **晶粒尺寸效应**: Scherrer公式描述，与 `1/cos(θ)` 成正比
-    - **微应变效应**: 与 `tan(θ)` 成正比
-    - **综合公式**: `β·cos(θ) = K·λ/D + 4·ε·sin(θ)`
+    **原理说明**: Williamson-Hall方法通过分析各衍射峰的展宽，分离晶粒尺寸细化和微应变/应力两个贡献。
+    - **均匀模型 (UDM)**: `β·cos(θ) = K·λ/D + 4·ε·sin(θ)`，假设各向同性微应变
+    - **各向异性模型 (USDM)**: `β·cos(θ) = K·λ/D + 4·σ·sin(θ)/E(hkl)`，考虑各晶面族的杨氏模量差异
     """)
     
     if st.session_state.exp_peaks is None or len(st.session_state.exp_peaks) == 0:
@@ -1208,6 +1606,19 @@ def wh_section():
         return
     
     st.info(f"📊 已从【指标化】页面读取到 {len(peaks)} 个峰的数据。")
+    
+    st.markdown("---")
+    st.subheader("⚙️ 分析模式")
+    
+    wh_mode = st.radio(
+        "分析模式",
+        ["均匀模型 (UDM)", "各向异性模型 (USDM)"],
+        index=0 if st.session_state.wh_mode == "UDM" else 1,
+        horizontal=True,
+        help="UDM假设各向同性微应变；USDM考虑各晶面族杨氏模量差异，计算均匀应力σ"
+    )
+    st.session_state.wh_mode = "UDM" if wh_mode == "均匀模型 (UDM)" else "USDM"
+    is_usdm = st.session_state.wh_mode == "USDM"
     
     st.markdown("---")
     st.subheader("⚙️ 仪器展宽参数")
@@ -1267,38 +1678,220 @@ def wh_section():
         "校正公式 (高斯型假设): β_sample = √(FWHM²_measured - FWHM²_instrument)"
     )
     
+    hkl_list = None
+    e_hkl_list = None
+    usdm_ready = True
+    
+    if is_usdm:
+        st.markdown("---")
+        st.subheader("📐 各向异性参数")
+        
+        crystal = st.session_state.crystals.get(st.session_state.current_phase)
+        if crystal is None:
+            st.error("❌ 未检测到晶体结构。请先在【衍射谱模拟】或【指标化】页面定义晶体结构，或选择已有晶相。")
+            usdm_ready = False
+        else:
+            crystal_system = crystal.crystal_system
+            st.info(f"当前晶体: {crystal.name} | 晶系: {crystal_system}")
+            
+            if crystal_system != "cubic":
+                st.error("⚠️ 当前晶系不支持各向异性W-H分析，请使用均匀模型(UDM)。"
+                         "本工具目前仅支持立方晶系的各向异性杨氏模量计算。")
+                usdm_ready = False
+            else:
+                st.success("✅ 立方晶系，支持USDM各向异性分析。")
+                
+                with st.expander("🔬 hkl匹配结果", expanded=True):
+                    hkl_list = match_hkl_for_peaks(
+                        peaks, crystal, st.session_state.wavelength
+                    )
+                    st.session_state.wh_hkl_list = hkl_list
+                    
+                    matched = sum(1 for h in hkl_list if h is not None)
+                    st.write(f"已匹配 hkl: {matched}/{len(peaks)} 个峰")
+                    
+                    hkl_preview = []
+                    for i, (peak, hkl) in enumerate(zip(peaks, hkl_list)):
+                        hkl_str = f"({hkl[0]}{hkl[1]}{hkl[2]})" if hkl else "未确定"
+                        hkl_preview.append({
+                            '峰序号': i + 1,
+                            '2θ (°)': round(peak.two_theta, 4),
+                            '匹配hkl': hkl_str,
+                            '状态': '✓ 已匹配' if hkl else '✗ 未匹配'
+                        })
+                    st.dataframe(pd.DataFrame(hkl_preview), use_container_width=True, height=250)
+                    
+                    unmatched = len(peaks) - matched
+                    if unmatched > 0:
+                        st.warning(f"⚠️ 有 {unmatched} 个峰未能匹配到hkl，这些峰将在USDM分析中被排除。")
+                
+                with st.expander("🧱 杨氏模量 E(hkl)", expanded=True):
+                    use_builtin = st.checkbox(
+                        "使用内置材料值",
+                        value=st.session_state.wh_usdm_use_builtin,
+                        help="从常见材料的文献柔顺系数计算各向异性杨氏模量"
+                    )
+                    st.session_state.wh_usdm_use_builtin = use_builtin
+                    
+                    if use_builtin:
+                        material_options = list(BUILTIN_MATERIALS.keys())
+                        cubic_materials = [m for m in material_options 
+                                          if BUILTIN_MATERIALS[m].get("crystal_system", "cubic") == "cubic"]
+                        
+                        default_idx = 0
+                        if st.session_state.wh_usdm_material in cubic_materials:
+                            default_idx = cubic_materials.index(st.session_state.wh_usdm_material)
+                        
+                        selected_material = st.selectbox(
+                            "选择材料",
+                            options=cubic_materials,
+                            index=default_idx,
+                            help="内置材料的柔顺系数来自文献实验值"
+                        )
+                        st.session_state.wh_usdm_material = selected_material
+                        
+                        mat_data = BUILTIN_MATERIALS[selected_material]
+                        st.caption(mat_data["description"])
+                        st.caption(f"柔顺系数: S11={mat_data['S11']:.3e}, S12={mat_data['S12']:.3e}, S44={mat_data['S44']:.3e} GPa⁻¹")
+                        
+                        e_hkl_list = []
+                        for hkl in hkl_list:
+                            if hkl is None:
+                                e_hkl_list.append(None)
+                            else:
+                                h, k, l = hkl
+                                e_val = compute_cubic_youngs_modulus(
+                                    h, k, l,
+                                    mat_data["S11"], mat_data["S12"], mat_data["S44"]
+                                )
+                                e_hkl_list.append(e_val if e_val > 0 else None)
+                    else:
+                        st.write("请为每个已匹配hkl的峰输入杨氏模量 E(hkl) (GPa):")
+                        e_hkl_list = []
+                        custom_e = st.session_state.wh_usdm_custom_e
+                        
+                        for i, (peak, hkl) in enumerate(zip(peaks, hkl_list)):
+                            if hkl is None:
+                                e_hkl_list.append(None)
+                                continue
+                            
+                            h, k, l = hkl
+                            key = f"e_hkl_{i}"
+                            default_val = custom_e.get(key, 100.0)
+                            
+                            col_e1, col_e2 = st.columns([1, 3])
+                            with col_e1:
+                                st.write(f"峰{i+1} ({h}{k}{l}):")
+                            with col_e2:
+                                e_val = st.number_input(
+                                    "E(hkl) GPa",
+                                    value=float(default_val),
+                                    min_value=0.1,
+                                    max_value=10000.0,
+                                    step=1.0,
+                                    format="%.2f",
+                                    key=f"wh_e_{i}",
+                                    label_visibility="collapsed"
+                                )
+                                custom_e[key] = e_val
+                                e_hkl_list.append(e_val)
+                        
+                        st.session_state.wh_usdm_custom_e = custom_e
+                    
+                    if e_hkl_list:
+                        e_preview = []
+                        for i, (hkl, e_val) in enumerate(zip(hkl_list, e_hkl_list)):
+                            hkl_str = f"({hkl[0]}{hkl[1]}{hkl[2]})" if hkl else "未确定"
+                            e_str = f"{e_val:.2f}" if e_val and e_val > 0 else "无效"
+                            e_preview.append({
+                                '峰序号': i + 1,
+                                'hkl': hkl_str,
+                                'E(hkl) (GPa)': e_str
+                            })
+                        st.dataframe(pd.DataFrame(e_preview), use_container_width=True, height=250)
+                    
+                    valid_e = [e for e in e_hkl_list if e is not None and e > 0]
+                    if len(valid_e) >= 2:
+                        e_arr = np.array(valid_e)
+                        rel_std = np.std(e_arr) / np.mean(e_arr)
+                        if rel_std < 0.001:
+                            st.info("💡 所有有效峰的E(hkl)值几乎相同，USDM将退化为UDM，建议切换到均匀模型。")
+    
     col_calc1, _ = st.columns([1, 4])
     with col_calc1:
         recalc_btn = st.button("🔄 重新计算", type="primary", use_container_width=True)
     
-    if recalc_btn or st.session_state.wh_result is None:
-        with st.spinner("正在执行Williamson-Hall分析..."):
-            wh_result = williamson_hall_analysis(
-                peaks=peaks,
-                wavelength=st.session_state.wavelength,
-                use_caglioti=st.session_state.wh_use_caglioti,
-                fwhm_fixed=wh_fwhm_val,
-                U=wh_U, V=wh_V, W=wh_W,
-                K=0.9
-            )
-            st.session_state.wh_result = wh_result
+    need_recalc = recalc_btn
+    if is_usdm:
+        stored_result = st.session_state.wh_result_usdm
+        if stored_result is None:
+            need_recalc = True
     else:
-        wh_result = st.session_state.wh_result
+        stored_result = st.session_state.wh_result_udm
+        if stored_result is None:
+            need_recalc = True
+    
+    if need_recalc:
+        if is_usdm and not usdm_ready:
+            st.error("❌ USDM模式参数不完整，请检查上述提示。")
+            wh_result = None
+        else:
+            with st.spinner(f"正在执行{wh_mode}分析..."):
+                if is_usdm:
+                    wh_result = williamson_hall_analysis_usdm(
+                        peaks=peaks,
+                        wavelength=st.session_state.wavelength,
+                        use_caglioti=st.session_state.wh_use_caglioti,
+                        fwhm_fixed=wh_fwhm_val,
+                        U=wh_U, V=wh_V, W=wh_W,
+                        hkl_list=hkl_list if hkl_list else [None] * len(peaks),
+                        e_hkl_list=e_hkl_list if e_hkl_list else [None] * len(peaks),
+                        K=0.9
+                    )
+                    st.session_state.wh_result_usdm = wh_result
+                    st.session_state.wh_result = wh_result
+                else:
+                    wh_result = williamson_hall_analysis(
+                        peaks=peaks,
+                        wavelength=st.session_state.wavelength,
+                        use_caglioti=st.session_state.wh_use_caglioti,
+                        fwhm_fixed=wh_fwhm_val,
+                        U=wh_U, V=wh_V, W=wh_W,
+                        K=0.9
+                    )
+                    st.session_state.wh_result_udm = wh_result
+                    st.session_state.wh_result = wh_result
+    else:
+        wh_result = stored_result
+    
+    if wh_result is None:
+        return
     
     st.markdown("---")
     
     if wh_result.valid_count < 3:
         st.error(f"❌ 有效峰数不足（当前 {wh_result.valid_count}/共 {wh_result.total_count}，至少需要3个）。"
                  f"无法进行W-H分析。请尝试：")
-        st.markdown("""
-        - 降低仪器展宽参数值
-        - 在【指标化】页面调整寻峰参数以获得更多峰
-        - 上传质量更高、峰更多的实验数据
-        """)
+        if is_usdm:
+            st.markdown("""
+            - 检查hkl匹配是否完整
+            - 验证所有匹配峰的E(hkl)值是否为正
+            - 降低仪器展宽参数值
+            - 在【指标化】页面调整寻峰参数以获得更多峰
+            """)
+        else:
+            st.markdown("""
+            - 降低仪器展宽参数值
+            - 在【指标化】页面调整寻峰参数以获得更多峰
+            - 上传质量更高、峰更多的实验数据
+            """)
         
         st.subheader("📋 各峰数据（排除原因）")
         _show_wh_peaks_table(wh_result, allow_export=True)
         return
+    
+    if is_usdm and wh_result.all_e_same and wh_result.valid_count >= 3:
+        st.info("💡 所有参与拟合峰的E(hkl)值相同，USDM退化为UDM，建议使用均匀模型。")
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -1310,11 +1903,18 @@ def wh_section():
         )
     
     with col2:
-        st.metric(
-            "微应变 ε",
-            f"{wh_result.microstrain:.6f}",
-            help="拟合直线的斜率 (x轴=4·sinθ)，通常范围 1e-5 ~ 1e-2"
-        )
+        if is_usdm:
+            st.metric(
+                "均匀应力 σ",
+                f"{wh_result.stress_mpa:.4f} MPa",
+                help="USDM拟合直线的斜率，单位为MPa (x轴=4·sinθ/E(hkl), 单位GPa⁻¹)"
+            )
+        else:
+            st.metric(
+                "微应变 ε",
+                f"{wh_result.microstrain:.6f}",
+                help="UDM拟合直线的斜率 (x轴=4·sinθ)，通常范围 1e-5 ~ 1e-2"
+            )
     
     with col3:
         st.metric(
@@ -1331,7 +1931,7 @@ def wh_section():
     
     if wh_result.r_squared < 0.5:
         st.warning("⚠️ 线性相关性差（R² < 0.5），W-H模型可能不适用于当前数据。"
-                   "建议检查：峰宽数据质量、仪器展宽校正是否合理、样品是否各向同性等。")
+                   "建议检查：峰宽数据质量、仪器展宽校正是否合理、样品是否各向同性/正确匹配hkl等。")
     
     st.markdown("---")
     st.subheader("📈 Williamson-Hall分析图")
@@ -1350,10 +1950,11 @@ def wh_section():
         if png_available:
             try:
                 png_bytes = fig.to_image(format="png", scale=2.0, width=1200, height=800)
+                suffix = "usdm" if is_usdm else "udm"
                 st.download_button(
                     "📥 导出PNG",
                     data=png_bytes,
-                    file_name="williamson_hall_plot.png",
+                    file_name=f"williamson_hall_{suffix}_plot.png",
                     mime="image/png",
                     use_container_width=True
                 )
@@ -1367,10 +1968,11 @@ def wh_section():
 
 
 def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
-    """展示W-H分析的峰数据表格（带标灰样式和导出功能）"""
+    """展示W-H分析的峰数据表格（带标灰样式和导出功能，支持UDM/USDM）"""
     
     table_data = []
     styles = []
+    is_usdm = wh_result.mode == "USDM"
     
     for i, pd_item in enumerate(wh_result.peaks_data):
         row = {
@@ -1382,8 +1984,17 @@ def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
             '仪器展宽 (°)': round(pd_item.fwhm_instrument, 4),
             '样品展宽β (°)': round(pd_item.beta_sample, 4) if not pd_item.excluded else '-',
             'β·cos(θ) (rad)': f"{pd_item.y_value:.6f}" if not pd_item.excluded else '-',
-            '4·sin(θ)': f"{pd_item.x_value:.6f}" if not pd_item.excluded else '-',
         }
+        if is_usdm:
+            hkl_str = f"({pd_item.hkl[0]}{pd_item.hkl[1]}{pd_item.hkl[2]})" if pd_item.hkl else "未确定"
+            row.insert(2, 'hkl', hkl_str)
+            row.insert(3, 'E(hkl) (GPa)', f"{pd_item.e_hkl:.2f}" if pd_item.e_hkl and pd_item.e_hkl > 0 else '-')
+            if not pd_item.excluded:
+                row['4·sin(θ)/E (GPa⁻¹)'] = f"{pd_item.x_value:.6f}"
+        else:
+            if not pd_item.excluded:
+                row['4·sin(θ)'] = f"{pd_item.x_value:.6f}"
+        
         if pd_item.excluded:
             row['备注'] = f"已排除: {pd_item.exclude_reason}"
             styles.append(i)
@@ -1404,8 +2015,8 @@ def _show_wh_peaks_table(wh_result: WHResult, allow_export: bool = True):
     
     excluded_count = sum(1 for p in wh_result.peaks_data if p.excluded)
     if excluded_count > 0:
-        st.caption(f"💡 灰色行表示该峰已被排除（共 {excluded_count} 个），原因通常为：仪器展宽大于实测峰宽。"
-                   f"可尝试降低仪器展宽参数值。")
+        st.caption(f"💡 灰色行表示该峰已被排除（共 {excluded_count} 个）。"
+                   f"可尝试调整仪器展宽参数或检查hkl/杨氏模量数据。")
     
     if allow_export:
         csv_buffer = io.StringIO()
