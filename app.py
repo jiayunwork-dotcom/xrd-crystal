@@ -158,6 +158,21 @@ def init_session_state():
     
     if 'wh_hkl_list' not in st.session_state:
         st.session_state.wh_hkl_list = None
+    
+    if 'cry_k_factor' not in st.session_state:
+        st.session_state.cry_k_factor = 1.0
+    
+    if 'cry_integral_min' not in st.session_state:
+        st.session_state.cry_integral_min = None
+    
+    if 'cry_integral_max' not in st.session_state:
+        st.session_state.cry_integral_max = None
+    
+    if 'cry_excluded_peaks' not in st.session_state:
+        st.session_state.cry_excluded_peaks = []
+    
+    if 'cry_result' not in st.session_state:
+        st.session_state.cry_result = None
 
 
 def create_default_crystal() -> Crystal:
@@ -180,7 +195,7 @@ with st.sidebar:
     st.header("📋 导航")
     page = st.radio(
         "选择功能",
-        ["衍射谱模拟", "晶体结构", "指标化", "W-H分析", "Le Bail拟合", "多相混合", "定量分析", "谱图对比"]
+        ["衍射谱模拟", "晶体结构", "指标化", "W-H分析", "Le Bail拟合", "多相混合", "定量分析", "谱图对比", "结晶度分析"]
     )
     
     st.markdown("---")
@@ -3377,6 +3392,714 @@ def compare_section():
                 st.info("暂无匹配峰数据，请先上传实验数据并寻峰")
 
 
+@dataclass
+class CrystallinityPeakResult:
+    """单个峰的结晶度分析结果"""
+    peak_index: int
+    two_theta: float
+    fwhm: float
+    integral_min: float
+    integral_max: float
+    area: float
+    excluded: bool
+    exclude_reason: str
+    baseline_y_min: float
+    baseline_y_max: float
+
+
+@dataclass
+class CrystallinityResult:
+    """结晶度分析完整结果"""
+    peaks_data: List[CrystallinityPeakResult]
+    total_area: float
+    crystalline_area: float
+    amorphous_area: float
+    crystallinity: float
+    amorphous_fraction: float
+    k_factor: float
+    integral_min: float
+    integral_max: float
+    valid_peak_count: int
+    total_peak_count: int
+    warning_negative_amorphous: bool
+    warning_abnormal_crystallinity: bool
+
+
+def trapezoid_integration(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    梯形法则数值积分（支持不等间距数据点）
+    
+    参数:
+        x: x坐标数组
+        y: y坐标数组
+    
+    返回:
+        积分面积
+    """
+    if len(x) < 2 or len(y) < 2:
+        return 0.0
+    if len(x) != len(y):
+        return 0.0
+    
+    n = len(x)
+    area = 0.0
+    for i in range(n - 1):
+        dx = x[i + 1] - x[i]
+        if dx <= 0:
+            continue
+        area += 0.5 * (y[i] + y[i + 1]) * dx
+    return area
+
+
+def compute_peak_area_with_baseline(
+    x: np.ndarray,
+    y: np.ndarray,
+    peak_twotheta: float,
+    peak_fwhm: float,
+    n_fwhm: float = 3.0
+) -> tuple:
+    """
+    计算单个峰的积分面积（扣除局部线性基线）
+    
+    参数:
+        x: 2theta数组
+        y: 强度数组
+        peak_twotheta: 峰位置 (2theta)
+        peak_fwhm: 峰的FWHM
+        n_fwhm: 积分范围倍数 (默认3倍FWHM)
+    
+    返回:
+        (面积, 积分下限, 积分上限, 基线左端点y值, 基线右端点y值, 数据点数量)
+    """
+    if peak_fwhm <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0
+    
+    integral_min = peak_twotheta - n_fwhm * peak_fwhm
+    integral_max = peak_twotheta + n_fwhm * peak_fwhm
+    
+    mask = (x >= integral_min) & (x <= integral_max)
+    x_sub = x[mask]
+    y_sub = y[mask]
+    
+    if len(x_sub) < 5:
+        return 0.0, integral_min, integral_max, 0.0, 0.0, len(x_sub)
+    
+    sort_idx = np.argsort(x_sub)
+    x_sub = x_sub[sort_idx]
+    y_sub = y_sub[sort_idx]
+    
+    left_idx = np.argmin(x_sub)
+    right_idx = np.argmax(x_sub)
+    x_left = x_sub[left_idx]
+    y_left = y_sub[left_idx]
+    x_right = x_sub[right_idx]
+    y_right = y_sub[right_idx]
+    
+    if x_right == x_left:
+        return 0.0, integral_min, integral_max, y_left, y_right, len(x_sub)
+    
+    baseline_slope = (y_right - y_left) / (x_right - x_left)
+    baseline = y_left + baseline_slope * (x_sub - x_left)
+    
+    y_corrected = y_sub - baseline
+    y_corrected = np.maximum(y_corrected, 0)
+    
+    area = trapezoid_integration(x_sub, y_corrected)
+    
+    return area, float(x_sub[0]), float(x_sub[-1]), float(y_left), float(y_right), len(x_sub)
+
+
+def crystallinity_analysis_ruland(
+    two_theta: np.ndarray,
+    intensity: np.ndarray,
+    peaks: list,
+    integral_min: float,
+    integral_max: float,
+    k_factor: float,
+    excluded_peaks: list = None
+) -> CrystallinityResult:
+    """
+    Ruland方法结晶度分析
+    
+    参数:
+        two_theta: 实验2theta数组
+        intensity: 实验强度数组
+        peaks: 实验峰列表 (Peak对象)
+        integral_min: 积分起始角度
+        integral_max: 积分结束角度
+        k_factor: 校正因子K
+        excluded_peaks: 手动排除的峰索引列表
+    
+    返回:
+        CrystallinityResult对象
+    """
+    if excluded_peaks is None:
+        excluded_peaks = []
+    
+    mask_total = (two_theta >= integral_min) & (two_theta <= integral_max)
+    x_total = two_theta[mask_total]
+    y_total = intensity[mask_total]
+    
+    if len(x_total) < 2:
+        return CrystallinityResult(
+            peaks_data=[],
+            total_area=0.0,
+            crystalline_area=0.0,
+            amorphous_area=0.0,
+            crystallinity=0.0,
+            amorphous_fraction=0.0,
+            k_factor=k_factor,
+            integral_min=integral_min,
+            integral_max=integral_max,
+            valid_peak_count=0,
+            total_peak_count=len(peaks),
+            warning_negative_amorphous=False,
+            warning_abnormal_crystallinity=False
+        )
+    
+    sort_idx_total = np.argsort(x_total)
+    x_total = x_total[sort_idx_total]
+    y_total = y_total[sort_idx_total]
+    
+    total_area = trapezoid_integration(x_total, y_total)
+    
+    peaks_data = []
+    crystalline_area = 0.0
+    valid_peak_count = 0
+    
+    for i, peak in enumerate(peaks):
+        peak_fwhm = peak.fwhm
+        peak_tt = peak.two_theta
+        
+        excluded = False
+        exclude_reason = ""
+        
+        if i in excluded_peaks:
+            excluded = True
+            exclude_reason = "手动排除"
+        elif peak_fwhm <= 0:
+            excluded = True
+            exclude_reason = "FWHM异常(≤0)"
+        elif peak_tt < integral_min or peak_tt > integral_max:
+            excluded = True
+            exclude_reason = "超出积分范围"
+        
+        if not excluded:
+            area, pk_min, pk_max, bl_left, bl_right, n_points = compute_peak_area_with_baseline(
+                two_theta, intensity, peak_tt, peak_fwhm, n_fwhm=3.0
+            )
+            
+            if n_points < 5:
+                excluded = True
+                exclude_reason = f"数据不足({n_points}<5)"
+                peaks_data.append(CrystallinityPeakResult(
+                    peak_index=i,
+                    two_theta=peak_tt,
+                    fwhm=peak_fwhm,
+                    integral_min=pk_min,
+                    integral_max=pk_max,
+                    area=0.0,
+                    excluded=True,
+                    exclude_reason=exclude_reason,
+                    baseline_y_min=bl_left,
+                    baseline_y_max=bl_right
+                ))
+            else:
+                crystalline_area += area
+                valid_peak_count += 1
+                peaks_data.append(CrystallinityPeakResult(
+                    peak_index=i,
+                    two_theta=peak_tt,
+                    fwhm=peak_fwhm,
+                    integral_min=pk_min,
+                    integral_max=pk_max,
+                    area=area,
+                    excluded=False,
+                    exclude_reason="",
+                    baseline_y_min=bl_left,
+                    baseline_y_max=bl_right
+                ))
+        else:
+            pk_min = peak_tt - 3.0 * peak_fwhm if peak_fwhm > 0 else peak_tt - 0.5
+            pk_max = peak_tt + 3.0 * peak_fwhm if peak_fwhm > 0 else peak_tt + 0.5
+            peaks_data.append(CrystallinityPeakResult(
+                peak_index=i,
+                two_theta=peak_tt,
+                fwhm=peak_fwhm,
+                integral_min=pk_min,
+                integral_max=pk_max,
+                area=0.0,
+                excluded=True,
+                exclude_reason=exclude_reason,
+                baseline_y_min=0.0,
+                baseline_y_max=0.0
+            ))
+    
+    warning_negative_amorphous = False
+    amorphous_area = total_area - crystalline_area
+    if amorphous_area < 0:
+        amorphous_area = 0.0
+        warning_negative_amorphous = True
+    
+    denominator = crystalline_area + k_factor * amorphous_area
+    if denominator > 0:
+        crystallinity = crystalline_area / denominator
+    else:
+        crystallinity = 0.0
+    
+    warning_abnormal_crystallinity = False
+    if crystallinity < 0:
+        crystallinity = 0.0
+        warning_abnormal_crystallinity = True
+    elif crystallinity > 1:
+        crystallinity = 1.0
+        warning_abnormal_crystallinity = True
+    
+    amorphous_fraction = 1.0 - crystallinity
+    
+    return CrystallinityResult(
+        peaks_data=peaks_data,
+        total_area=total_area,
+        crystalline_area=crystalline_area,
+        amorphous_area=amorphous_area,
+        crystallinity=crystallinity,
+        amorphous_fraction=amorphous_fraction,
+        k_factor=k_factor,
+        integral_min=integral_min,
+        integral_max=integral_max,
+        valid_peak_count=valid_peak_count,
+        total_peak_count=len(peaks),
+        warning_negative_amorphous=warning_negative_amorphous,
+        warning_abnormal_crystallinity=warning_abnormal_crystallinity
+    )
+
+
+def create_crystallinity_plot(
+    result: CrystallinityResult,
+    two_theta: np.ndarray,
+    intensity: np.ndarray
+) -> go.Figure:
+    """
+    创建结晶度分析叠加图
+    
+    参数:
+        result: CrystallinityResult对象
+        two_theta: 2theta数组
+        intensity: 强度数组
+    
+    返回:
+        plotly Figure对象
+    """
+    fig = go.Figure()
+    
+    integral_min = result.integral_min
+    integral_max = result.integral_max
+    mask = (two_theta >= integral_min) & (two_theta <= integral_max)
+    x_plot = two_theta[mask]
+    y_plot = intensity[mask]
+    
+    crystalline_mask = np.zeros_like(x_plot, dtype=bool)
+    crystalline_y_fill_top = np.zeros_like(x_plot)
+    
+    for pd_item in result.peaks_data:
+        if pd_item.excluded:
+            continue
+        pk_mask = (x_plot >= pd_item.integral_min) & (x_plot <= pd_item.integral_max)
+        if not np.any(pk_mask):
+            continue
+        
+        x_sub = x_plot[pk_mask]
+        if len(x_sub) < 2:
+            continue
+        
+        x_left = pd_item.integral_min
+        x_right = pd_item.integral_max
+        y_left = pd_item.baseline_y_min
+        y_right = pd_item.baseline_y_max
+        if x_right > x_left:
+            bl_slope = (y_right - y_left) / (x_right - x_left)
+            baseline = y_left + bl_slope * (x_sub - x_left)
+        else:
+            baseline = np.full_like(x_sub, y_left)
+        
+        y_sub = y_plot[pk_mask]
+        y_corrected = np.maximum(y_sub - baseline, 0)
+        
+        crystalline_y_fill_top[pk_mask] = np.maximum(crystalline_y_fill_top[pk_mask], y_corrected + baseline)
+        crystalline_mask[pk_mask] = True
+        
+        fig.add_trace(go.Scatter(
+            x=[x_left, x_right],
+            y=[y_left, y_right],
+            mode='lines',
+            line=dict(color='gray', width=1.5, dash='dash'),
+            name=f'基线 峰{pd_item.peak_index+1}',
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+    
+    amorphous_y_top = y_plot.copy()
+    amorphous_y_top[crystalline_mask] = np.minimum(
+        y_plot[crystalline_mask],
+        y_plot[crystalline_mask] - crystalline_y_fill_top[crystalline_mask]
+    )
+    
+    fig.add_trace(go.Scatter(
+        x=x_plot,
+        y=y_plot,
+        mode='lines',
+        name='原始谱图',
+        line=dict(color='black', width=1.5),
+        hovertemplate='2θ=%{x:.3f}°<br>I=%{y:.2f}<extra></extra>'
+    ))
+    
+    valid_peaks = [p for p in result.peaks_data if not p.excluded]
+    for i, pd_item in enumerate(valid_peaks):
+        pk_mask = (x_plot >= pd_item.integral_min) & (x_plot <= pd_item.integral_max)
+        if not np.any(pk_mask):
+            continue
+        
+        x_sub = x_plot[pk_mask]
+        y_sub = y_plot[pk_mask]
+        
+        x_left = pd_item.integral_min
+        x_right = pd_item.integral_max
+        y_left = pd_item.baseline_y_min
+        y_right = pd_item.baseline_y_max
+        if x_right > x_left:
+            bl_slope = (y_right - y_left) / (x_right - x_left)
+            baseline = y_left + bl_slope * (x_sub - x_left)
+        else:
+            baseline = np.full_like(x_sub, y_left)
+        
+        fill_y = np.maximum(y_sub - baseline, 0) + baseline
+        
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([x_sub, x_sub[::-1]]),
+            y=np.concatenate([baseline, fill_y[::-1]]),
+            fill='toself',
+            fillcolor='rgba(31, 119, 180, 0.35)',
+            line=dict(color='rgba(31, 119, 180, 0)'),
+            name=f'结晶区 峰{pd_item.peak_index+1}',
+            showlegend=(i == 0),
+            legendgroup='crystalline',
+            hoverinfo='skip'
+        ))
+    
+    if len(valid_peaks) > 0:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None],
+            mode='markers',
+            marker=dict(size=10, color='rgba(31, 119, 180, 0.5)', symbol='square'),
+            name='结晶峰区域',
+            legendgroup='crystalline'
+        ))
+    
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode='markers',
+        marker=dict(size=10, color='rgba(255, 127, 14, 0.5)', symbol='square'),
+        name='非晶散射区域'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=[None], y=[None],
+        mode='lines',
+        line=dict(color='gray', width=1.5, dash='dash'),
+        name='局部基线'
+    ))
+    
+    fig.update_layout(
+        title="XRD谱图 - 结晶度分析 (Ruland方法)",
+        xaxis_title="2θ (°)",
+        yaxis_title="强度",
+        height=500,
+        legend=dict(orientation='h', y=1.02),
+        hovermode='x unified',
+        xaxis=dict(range=[integral_min, integral_max])
+    )
+    
+    return fig
+
+
+def crystallinity_section():
+    """结晶度分析页面"""
+    st.header("📐 结晶度分析 (Ruland方法)")
+    
+    st.markdown("""
+    **原理说明**: Ruland方法将XRD谱图的总散射强度分解为结晶贡献和非晶贡献两部分，通过积分面积之比定量计算结晶度。
+    
+    核心公式：
+    - **总积分面积** = 结晶峰面积之和 + 非晶散射面积
+    - **结晶度 Xc** = 结晶峰面积总和 / (结晶峰面积总和 + K × 非晶散射面积)
+    - **非晶含量** = 1 - Xc
+    
+    其中 **K** 为校正因子（默认1.0），用于补偿结晶相和非晶相反射能力的差异。
+    """)
+    
+    st.markdown("---")
+    
+    if st.session_state.exp_data is None:
+        st.warning("⚠️ 请先在【指标化】页面上传实验XRD数据。")
+        return
+    
+    if st.session_state.exp_peaks is None or len(st.session_state.exp_peaks) == 0:
+        st.warning("⚠️ 请先在【指标化】页面完成自动寻峰。")
+        return
+    
+    two_theta = st.session_state.exp_data['two_theta']
+    intensity = st.session_state.exp_data['intensity']
+    peaks = st.session_state.exp_peaks
+    
+    has_valid_fwhm = any(p.fwhm > 0 for p in peaks)
+    if not has_valid_fwhm:
+        st.warning("⚠️ 当前寻峰结果中没有可用的FWHM数据。请重新执行寻峰，确保数据点密度足够。")
+        return
+    
+    st.info(f"📊 已读取 {len(two_theta)} 个实验数据点，共 {len(peaks)} 个峰。")
+    
+    st.markdown("---")
+    st.subheader("⚙️ 计算参数")
+    
+    col_param1, col_param2 = st.columns(2)
+    
+    with col_param1:
+        exp_tt_min = float(np.min(two_theta))
+        exp_tt_max = float(np.max(two_theta))
+        
+        if st.session_state.cry_integral_min is None:
+            st.session_state.cry_integral_min = exp_tt_min
+        if st.session_state.cry_integral_max is None:
+            st.session_state.cry_integral_max = exp_tt_max
+        
+        integral_range = st.slider(
+            "积分范围 2θ (°)",
+            min_value=exp_tt_min,
+            max_value=exp_tt_max,
+            value=(st.session_state.cry_integral_min, st.session_state.cry_integral_max),
+            step=0.01,
+            format="%.2f",
+            help="总面积的积分角度范围，默认取实验数据完整范围"
+        )
+        st.session_state.cry_integral_min = integral_range[0]
+        st.session_state.cry_integral_max = integral_range[1]
+    
+    with col_param2:
+        k_factor = st.number_input(
+            "校正因子 K",
+            min_value=0.5,
+            max_value=2.0,
+            value=float(st.session_state.cry_k_factor),
+            step=0.01,
+            format="%.2f",
+            help="结晶相/非晶相反射能力校正因子，默认1.0，范围0.5~2.0"
+        )
+        st.session_state.cry_k_factor = k_factor
+    
+    st.markdown("---")
+    st.subheader("🔍 峰排除设置")
+    
+    excluded_peaks = list(st.session_state.cry_excluded_peaks)
+    
+    peak_data_preview = []
+    for i, peak in enumerate(peaks):
+        peak_data_preview.append({
+            '峰序号': i + 1,
+            '2θ (°)': round(peak.two_theta, 4),
+            'FWHM (°)': round(peak.fwhm, 4) if peak.fwhm > 0 else '-',
+            '强度 (%)': round(peak.intensity * 100, 2),
+            '手动排除': i in excluded_peaks
+        })
+    
+    df_preview = pd.DataFrame(peak_data_preview)
+    
+    st.caption("勾选以下复选框手动排除某些峰（如杂质峰），不参与结晶度计算：")
+    
+    peak_cols = st.columns(4)
+    new_excluded = []
+    for i, peak in enumerate(peaks):
+        col_idx = i % 4
+        with peak_cols[col_idx]:
+            is_excluded = st.checkbox(
+                f"峰{i+1}: 2θ={peak.two_theta:.2f}°",
+                value=(i in excluded_peaks),
+                key=f"cry_exclude_cb_{i}"
+            )
+            if is_excluded:
+                new_excluded.append(i)
+    st.session_state.cry_excluded_peaks = new_excluded
+    
+    with st.expander("📋 峰信息表", expanded=False):
+        styles_idx = [i for i in range(len(peaks)) if i in new_excluded]
+        
+        def highlight_excluded(row_idx):
+            return ['background-color: #d3d3d3; color: #808080'] * len(df_preview.columns) if row_idx in styles_idx else [''] * len(df_preview.columns)
+        
+        if styles_idx:
+            styled_df = df_preview.style.apply(lambda x: highlight_excluded(x.name), axis=1)
+            st.dataframe(styled_df, use_container_width=True, height=300)
+        else:
+            st.dataframe(df_preview, use_container_width=True, height=300)
+    
+    st.markdown("---")
+    
+    with st.spinner("正在执行结晶度分析..."):
+        result = crystallinity_analysis_ruland(
+            two_theta=two_theta,
+            intensity=intensity,
+            peaks=peaks,
+            integral_min=st.session_state.cry_integral_min,
+            integral_max=st.session_state.cry_integral_max,
+            k_factor=k_factor,
+            excluded_peaks=new_excluded
+        )
+    
+    st.session_state.cry_result = result
+    
+    if result.warning_negative_amorphous:
+        st.warning("⚠️ 警告：结晶峰面积超过总积分面积，可能存在基线问题，建议调整积分范围。非晶面积已置为0。")
+    
+    if result.warning_abnormal_crystallinity:
+        st.warning("⚠️ 警告：结晶度计算结果超出0%~100%范围，已截断至有效区间。")
+    
+    if result.valid_peak_count == 0:
+        st.error("❌ 无有效峰可用于结晶度计算。")
+        reasons = []
+        for pd_item in result.peaks_data:
+            if pd_item.excluded and pd_item.exclude_reason:
+                reasons.append(f"峰{pd_item.peak_index+1}: {pd_item.exclude_reason}")
+        if reasons:
+            with st.expander("🔍 各峰排除原因", expanded=True):
+                for r in reasons:
+                    st.write(f"- {r}")
+        return
+    
+    st.subheader("📊 分析结果")
+    
+    col_res1, col_res2 = st.columns(2)
+    with col_res1:
+        xc_pct = result.crystallinity * 100
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, #e8f5e9 0%, #c8e6c9 100%);
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border: 2px solid #66bb6a;
+        ">
+            <div style="font-size: 16px; color: #2e7d32; margin-bottom: 8px; font-weight: 600;">
+                💎 结晶度 Xc
+            </div>
+            <div style="font-size: 52px; font-weight: 800; color: #1b5e20; line-height: 1.1;">
+                {xc_pct:.1f}%
+            </div>
+            <div style="font-size: 13px; color: #4caf50; margin-top: 8px; opacity: 0.8;">
+                (K = {result.k_factor:.2f})
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col_res2:
+        am_pct = result.amorphous_fraction * 100
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, #fff3e0 0%, #ffe0b2 100%);
+            border-radius: 16px;
+            padding: 24px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            border: 2px solid #ffa726;
+        ">
+            <div style="font-size: 16px; color: #e65100; margin-bottom: 8px; font-weight: 600;">
+                🔶 非晶含量
+            </div>
+            <div style="font-size: 52px; font-weight: 800; color: #bf360c; line-height: 1.1;">
+                {am_pct:.1f}%
+            </div>
+            <div style="font-size: 13px; color: #ff9800; margin-top: 8px; opacity: 0.8;">
+                = 1 - Xc
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.markdown("---")
+    
+    col_plot, col_summary = st.columns([3, 1])
+    
+    with col_plot:
+        st.subheader("📈 谱图叠加")
+        fig = create_crystallinity_plot(result, two_theta, intensity)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col_summary:
+        st.subheader("📋 参数汇总")
+        
+        st.markdown("#### 积分面积")
+        st.metric("总面积", f"{result.total_area:.2f}")
+        st.metric("结晶峰总面积", f"{result.crystalline_area:.2f}")
+        st.metric("非晶面积", f"{result.amorphous_area:.2f}")
+        
+        st.markdown("#### 计算参数")
+        st.metric("K因子", f"{result.k_factor:.2f}")
+        st.metric("积分范围", f"{result.integral_min:.1f}~{result.integral_max:.1f}°")
+        st.metric("有效峰数", f"{result.valid_peak_count}/{result.total_peak_count}")
+    
+    st.markdown("---")
+    st.subheader("📋 各峰贡献明细")
+    
+    table_data = []
+    styles_table = []
+    
+    total_crystalline = result.crystalline_area if result.crystalline_area > 0 else 1.0
+    
+    for pd_item in result.peaks_data:
+        pct = (pd_item.area / total_crystalline * 100) if not pd_item.excluded else 0.0
+        row = {
+            '峰序号': pd_item.peak_index + 1,
+            '峰位 2θ (°)': round(pd_item.two_theta, 4),
+            'FWHM (°)': round(pd_item.fwhm, 4) if pd_item.fwhm > 0 else '-',
+            '积分范围 (°)': f"{pd_item.integral_min:.2f} ~ {pd_item.integral_max:.2f}",
+            '峰面积': f"{pd_item.area:.2f}" if not pd_item.excluded else '-',
+            '占总结晶面积 (%)': f"{pct:.2f}" if not pd_item.excluded else '-'
+        }
+        if pd_item.excluded:
+            row['状态'] = f"已排除: {pd_item.exclude_reason}"
+            styles_table.append(pd_item.peak_index)
+        else:
+            row['状态'] = f"参与计算 (占比{pct:.1f}%)"
+        table_data.append(row)
+    
+    df_table = pd.DataFrame(table_data)
+    
+    if styles_table:
+        def highlight_excluded_table(row_idx):
+            return ['background-color: #d3d3d3; color: #808080'] * len(df_table.columns) if row_idx in styles_table else [''] * len(df_table.columns)
+        
+        styled_df_table = df_table.style.apply(lambda x: highlight_excluded_table(x.name), axis=1)
+        st.dataframe(styled_df_table, use_container_width=True, height=400)
+    else:
+        st.dataframe(df_table, use_container_width=True, height=400)
+    
+    excluded_count = sum(1 for p in result.peaks_data if p.excluded)
+    if excluded_count > 0:
+        st.caption(f"💡 灰色行表示该峰已被排除（共 {excluded_count} 个）。可通过上方复选框调整峰排除设置。")
+    
+    csv_buffer = io.StringIO()
+    df_table.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+    csv_data = csv_buffer.getvalue()
+    
+    col_export, _ = st.columns([1, 4])
+    with col_export:
+        st.download_button(
+            "📥 导出明细 (CSV)",
+            data=csv_data,
+            file_name="crystallinity_peaks_detail.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+
 if page == "衍射谱模拟":
     crystal_input_section()
     st.markdown("---")
@@ -3404,6 +4127,9 @@ elif page == "定量分析":
 
 elif page == "谱图对比":
     compare_section()
+
+elif page == "结晶度分析":
+    crystallinity_section()
 
 
 with st.sidebar:
