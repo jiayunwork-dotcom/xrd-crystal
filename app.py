@@ -173,6 +173,9 @@ def init_session_state():
     
     if 'cry_result' not in st.session_state:
         st.session_state.cry_result = None
+    
+    if 'cry_compare_list' not in st.session_state:
+        st.session_state.cry_compare_list = []
 
 
 def create_default_crystal() -> Crystal:
@@ -4098,6 +4101,245 @@ def crystallinity_section():
             mime="text/csv",
             use_container_width=True
         )
+    
+    st.markdown("---")
+    st.header("📊 参数敏感性分析")
+    st.markdown("**多相结晶度对比**: 保存不同参数下的结晶度计算结果，对比分析参数敏感性。")
+    
+    compare_list = st.session_state.cry_compare_list
+    
+    col_add, col_clear, _ = st.columns([2, 2, 6])
+    
+    with col_add:
+        if st.button("➕ 添加对比方案", type="primary", use_container_width=True, disabled=len(compare_list) >= 6):
+            current_k = k_factor
+            current_min = st.session_state.cry_integral_min
+            current_max = st.session_state.cry_integral_max
+            current_excluded = sorted(st.session_state.cry_excluded_peaks)
+            
+            is_duplicate = False
+            for scheme in compare_list:
+                if (abs(scheme['k_factor'] - current_k) < 1e-6 and
+                    abs(scheme['integral_min'] - current_min) < 1e-6 and
+                    abs(scheme['integral_max'] - current_max) < 1e-6 and
+                    scheme['excluded_peaks'] == current_excluded):
+                    is_duplicate = True
+                    break
+            
+            if is_duplicate:
+                st.warning("该参数组合已存在")
+            elif len(compare_list) >= 6:
+                st.warning("最多保存6组对比方案")
+            else:
+                scheme_result = crystallinity_analysis_ruland(
+                    two_theta=two_theta,
+                    intensity=intensity,
+                    peaks=peaks,
+                    integral_min=current_min,
+                    integral_max=current_max,
+                    k_factor=current_k,
+                    excluded_peaks=st.session_state.cry_excluded_peaks
+                )
+                scheme = {
+                    'id': len(compare_list) + 1,
+                    'k_factor': current_k,
+                    'integral_min': current_min,
+                    'integral_max': current_max,
+                    'excluded_peaks': current_excluded,
+                    'result': scheme_result
+                }
+                st.session_state.cry_compare_list.append(scheme)
+                st.success(f"已添加方案 #{len(compare_list) + 1}")
+                st.rerun()
+    
+    with col_clear:
+        if st.button("🗑️ 清空对比", type="secondary", use_container_width=True, disabled=len(compare_list) == 0):
+            st.session_state.cry_compare_list = []
+            st.rerun()
+    
+    st.caption(f"当前已保存 {len(compare_list)}/6 组对比方案")
+    
+    colors = ['#0d47a1', '#1565c0', '#1976d2', '#1e88e5', '#42a5f5', '#90caf9']
+    
+    if len(compare_list) > 0:
+        st.markdown("---")
+        st.subheader("📈 结晶度对比柱状图")
+        
+        fig_bar = go.Figure()
+        
+        scheme_labels = []
+        scheme_values = []
+        scheme_colors = []
+        scheme_text = []
+        
+        for i, scheme in enumerate(compare_list):
+            color = colors[i % len(colors)]
+            xc_pct = scheme['result'].crystallinity * 100
+            scheme_labels.append(f"方案#{scheme['id']}")
+            scheme_values.append(xc_pct)
+            scheme_colors.append(color)
+            scheme_text.append(f"{xc_pct:.1f}%")
+        
+        fig_bar.add_trace(go.Bar(
+            x=scheme_labels,
+            y=scheme_values,
+            marker_color=scheme_colors,
+            text=scheme_text,
+            textposition='outside',
+            textfont=dict(size=14, color='black'),
+            hovertemplate='<b>%{x}</b><br>结晶度: %{y:.2f}%<extra></extra>',
+            showlegend=False
+        ))
+        
+        fig_bar.update_layout(
+            title="各方案结晶度对比",
+            xaxis_title="对比方案",
+            yaxis_title="结晶度 (%)",
+            yaxis=dict(range=[0, max(scheme_values + [10]) * 1.15]),
+            height=450,
+            bargap=0.3
+        )
+        
+        st.plotly_chart(fig_bar, use_container_width=True)
+        
+        st.markdown("---")
+        st.subheader("📋 对比数据表")
+        
+        table_rows = []
+        for scheme in compare_list:
+            res = scheme['result']
+            table_rows.append({
+                '方案序号': f"#{scheme['id']}",
+                'K值': f"{scheme['k_factor']:.2f}",
+                '积分范围 (°)': f"{scheme['integral_min']:.1f} ~ {scheme['integral_max']:.1f}",
+                '排除峰数': len(scheme['excluded_peaks']),
+                '结晶度 (%)': f"{res.crystallinity * 100:.2f}",
+                '非晶含量 (%)': f"{res.amorphous_fraction * 100:.2f}",
+                '结晶峰面积': f"{res.crystalline_area:.2f}",
+                '非晶面积': f"{res.amorphous_area:.2f}",
+                '操作': ''
+            })
+        
+        df_compare = pd.DataFrame(table_rows)
+        
+        col_table, col_actions = st.columns([5, 1])
+        
+        with col_table:
+            st.dataframe(df_compare, use_container_width=True, hide_index=True, height=min(100 + len(compare_list) * 40, 400))
+        
+        with col_actions:
+            st.markdown("**删除**")
+            for i, scheme in enumerate(compare_list):
+                if st.button(f"❌ 删除 #{scheme['id']}", key=f"del_scheme_{scheme['id']}", use_container_width=True):
+                    st.session_state.cry_compare_list.pop(i)
+                    for j, s in enumerate(st.session_state.cry_compare_list):
+                        s['id'] = j + 1
+                    st.rerun()
+    
+    st.markdown("---")
+    st.subheader("📉 K值-结晶度关系曲线")
+    st.caption("固定当前积分范围和峰排除设置，K从0.5到2.0扫描")
+    
+    current_min = st.session_state.cry_integral_min
+    current_max = st.session_state.cry_integral_max
+    current_excluded = st.session_state.cry_excluded_peaks
+    
+    k_values = np.linspace(0.5, 2.0, 16)
+    crystallinity_values = []
+    
+    for k in k_values:
+        scan_result = crystallinity_analysis_ruland(
+            two_theta=two_theta,
+            intensity=intensity,
+            peaks=peaks,
+            integral_min=current_min,
+            integral_max=current_max,
+            k_factor=float(k),
+            excluded_peaks=current_excluded
+        )
+        crystallinity_values.append(scan_result.crystallinity * 100)
+    
+    fig_k = go.Figure()
+    
+    fig_k.add_trace(go.Scatter(
+        x=k_values,
+        y=crystallinity_values,
+        mode='lines+markers',
+        name='K值扫描曲线',
+        line=dict(color='#1976d2', width=3),
+        marker=dict(size=6, color='#1976d2'),
+        hovertemplate='K=%{x:.2f}<br>结晶度=%{y:.2f}%<extra></extra>'
+    ))
+    
+    current_k = k_factor
+    current_xc = result.crystallinity * 100
+    
+    fig_k.add_vline(
+        x=current_k,
+        line_dash="dash",
+        line_color="#ff5722",
+        line_width=2,
+        annotation_text=f"当前 K={current_k:.2f}",
+        annotation_position="top right",
+        annotation_font=dict(color="#ff5722", size=12)
+    )
+    
+    fig_k.add_trace(go.Scatter(
+        x=[current_k],
+        y=[current_xc],
+        mode='markers',
+        name='当前K值',
+        marker=dict(size=14, color='#ff5722', symbol='diamond'),
+        hovertemplate='<b>当前K值</b><br>K=%{x:.2f}<br>结晶度=%{y:.2f}%<extra></extra>'
+    ))
+    
+    if len(compare_list) > 0:
+        scheme_k_list = []
+        scheme_xc_list = []
+        scheme_colors_k = []
+        for i, scheme in enumerate(compare_list):
+            color = colors[i % len(colors)]
+            scheme_k_list.append(scheme['k_factor'])
+            scheme_xc_list.append(scheme['result'].crystallinity * 100)
+            scheme_colors_k.append(color)
+        
+        fig_k.add_trace(go.Scatter(
+            x=scheme_k_list,
+            y=scheme_xc_list,
+            mode='markers',
+            name='已保存方案',
+            marker=dict(size=10, color=scheme_colors_k, symbol='square'),
+            text=[f"方案#{s['id']}" for s in compare_list],
+            hovertemplate='<b>%{text}</b><br>K=%{x:.2f}<br>结晶度=%{y:.2f}%<extra></extra>'
+        ))
+    
+    fig_k.update_layout(
+        title="K值-结晶度关系曲线",
+        xaxis_title="K值 (校正因子)",
+        yaxis_title="结晶度 (%)",
+        height=450,
+        hovermode='x unified',
+        legend=dict(orientation='h', y=1.02)
+    )
+    
+    st.plotly_chart(fig_k, use_container_width=True)
+    
+    with st.expander("📖 查看说明", expanded=False):
+        st.markdown("""
+        **参数敏感性分析说明**：
+        
+        1. **添加对比方案**: 以当前参数（K值、积分范围、排除峰）创建快照，保存到对比列表中，最多6组。
+        
+        2. **柱状图**: 横向并排展示各方案的结晶度数值，颜色从深蓝到浅蓝渐变。
+        
+        3. **K值扫描曲线**: 固定积分范围和峰排除设置，K值从0.5到2.0以0.1步长扫描，
+           显示结晶度随K值变化的连续曲线。橙色虚线标注当前K值位置。
+        
+        4. **对比数据表**: 列出每个方案的详细参数和计算结果。
+        
+        5. **数据联动**: K值扫描曲线实时反映当前积分范围和排除峰设置的变化；
+           已保存的对比方案为添加时刻的快照，不会随参数调整自动更新。
+        """)
 
 
 if page == "衍射谱模拟":
